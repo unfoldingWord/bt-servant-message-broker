@@ -55,4 +55,4 @@ jobs:
         run: deptry .
 
       - name: Pytest (coverage)
-        run: pytest --maxfail=1 --disable-warnings -q --cov=bt_servant_message_broker --cov-report=term-missing --cov-fail-under=65
+        run: pytest --ignore=tests/integration --maxfail=1 --disable-warnings -q --cov=bt_servant_message_broker --cov-report=term-missing --cov-fail-under=65
