@@ -1,9 +1,13 @@
 """HTTP client for communicating with bt-servant-worker."""
 
+import logging
+import time
 from typing import Any
 
 import httpx
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class WorkerResponse(BaseModel):
@@ -95,17 +99,62 @@ class WorkerClient:
         if message_data.get("audio_format"):
             payload["audio_format"] = message_data["audio_format"]
 
+        user_id = payload.get("user_id")
+        org = payload.get("org")
+        message_type = payload.get("message_type")
+
+        logger.info(
+            "Sending request to worker",
+            extra={
+                "user_id": user_id,
+                "org": org,
+                "message_type": message_type,
+                "worker_url": self._base_url,
+            },
+        )
+
+        start_time = time.monotonic()
+
         try:
             response = await client.post(
                 f"{self._base_url}/api/v1/chat",
                 json=payload,
             )
         except httpx.TimeoutException as e:
+            duration_ms = (time.monotonic() - start_time) * 1000
+            logger.error(
+                "Worker request timed out",
+                extra={
+                    "user_id": user_id,
+                    "timeout_seconds": self._timeout,
+                    "duration_ms": round(duration_ms, 2),
+                },
+            )
             raise WorkerTimeoutError(self._timeout) from e
         except httpx.ConnectError as e:
+            duration_ms = (time.monotonic() - start_time) * 1000
+            logger.error(
+                "Worker unreachable",
+                extra={
+                    "user_id": user_id,
+                    "worker_url": self._base_url,
+                    "error": str(e),
+                    "duration_ms": round(duration_ms, 2),
+                },
+            )
             raise WorkerError(503, f"Worker unreachable: {e}") from e
 
+        duration_ms = (time.monotonic() - start_time) * 1000
+
         if response.status_code >= 400:
+            logger.error(
+                "Worker returned error",
+                extra={
+                    "user_id": user_id,
+                    "status_code": response.status_code,
+                    "duration_ms": round(duration_ms, 2),
+                },
+            )
             # Pass through 4xx errors, wrap 5xx as 502
             if response.status_code >= 500:
                 raise WorkerError(502, f"Worker error: {response.text}")
@@ -113,8 +162,27 @@ class WorkerClient:
 
         try:
             data = response.json()
-            return WorkerResponse(**data)
+            worker_response = WorkerResponse(**data)
+            logger.info(
+                "Worker request successful",
+                extra={
+                    "user_id": user_id,
+                    "status_code": response.status_code,
+                    "duration_ms": round(duration_ms, 2),
+                    "response_language": worker_response.response_language,
+                    "response_count": len(worker_response.responses),
+                },
+            )
+            return worker_response
         except Exception as e:
+            logger.error(
+                "Invalid worker response",
+                extra={
+                    "user_id": user_id,
+                    "error": str(e),
+                    "duration_ms": round(duration_ms, 2),
+                },
+            )
             raise WorkerError(502, f"Invalid worker response: {e}") from e
 
     async def health_check(self) -> bool:
@@ -127,8 +195,21 @@ class WorkerClient:
 
         try:
             response = await client.get(f"{self._base_url}/health")
-            return response.status_code == 200
-        except (httpx.TimeoutException, httpx.ConnectError):
+            is_healthy = response.status_code == 200
+            logger.debug(
+                "Worker health check",
+                extra={
+                    "worker_url": self._base_url,
+                    "status_code": response.status_code,
+                    "is_healthy": is_healthy,
+                },
+            )
+            return is_healthy
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            logger.warning(
+                "Worker health check failed",
+                extra={"worker_url": self._base_url, "error": str(e)},
+            )
             return False
 
     async def close(self) -> None:

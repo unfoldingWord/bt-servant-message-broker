@@ -1,5 +1,6 @@
 """API route definitions for the message broker."""
 
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
@@ -19,6 +20,8 @@ from bt_servant_message_broker.models import (
 from bt_servant_message_broker.services.queue_manager import QueueManager
 from bt_servant_message_broker.services.worker_client import WorkerError, WorkerTimeoutError
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 
@@ -36,7 +39,18 @@ async def submit_message(
     processed immediately and the response is returned synchronously.
     Otherwise, the message is queued and the response indicates queued status.
     """
+    logger.info(
+        "Received message submission",
+        extra={
+            "user_id": request.user_id,
+            "org_id": request.org_id,
+            "client_id": request.client_id.value,
+            "message_type": request.message_type.value,
+        },
+    )
+
     if queue_manager is None:
+        logger.error("Queue service unavailable")
         raise HTTPException(status_code=503, detail="Queue service unavailable")
 
     message_id = QueueManager.generate_message_id()
@@ -50,6 +64,14 @@ async def submit_message(
                 request.user_id, message_id, message_data
             )
             if response:
+                logger.info(
+                    "Message processed immediately",
+                    extra={
+                        "user_id": request.user_id,
+                        "message_id": message_id,
+                        "status": "completed",
+                    },
+                )
                 return MessageResponse(
                     status="completed",
                     message_id=message_id,
@@ -58,13 +80,34 @@ async def submit_message(
                     voice_audio_base64=response.voice_audio_base64,
                 )
         except WorkerTimeoutError as e:
+            logger.error(
+                "Worker timeout during message processing",
+                extra={"user_id": request.user_id, "message_id": message_id},
+            )
             raise HTTPException(status_code=504, detail="Worker request timed out") from e
         except WorkerError as e:
+            logger.error(
+                "Worker error during message processing",
+                extra={
+                    "user_id": request.user_id,
+                    "message_id": message_id,
+                    "worker_status_code": e.status_code,
+                },
+            )
             # Pass through 4xx, wrap 5xx as 502
             status_code = 502 if e.status_code >= 500 else e.status_code
             raise HTTPException(status_code=status_code, detail=e.detail) from e
 
     # Message stays queued (user busy or no processor configured)
+    logger.info(
+        "Message queued (user busy or no processor)",
+        extra={
+            "user_id": request.user_id,
+            "message_id": message_id,
+            "queue_position": position,
+            "status": "queued",
+        },
+    )
     return MessageResponse(
         status="queued",
         message_id=message_id,
@@ -79,14 +122,31 @@ async def get_queue_status(
     queue_manager: RequireQueueManager,
 ) -> QueueStatusResponse:
     """Get the queue status for a user."""
+    logger.debug("Queue status request", extra={"user_id": user_id})
+
     if queue_manager is None:
+        logger.error("Queue service unavailable")
         raise HTTPException(status_code=503, detail="Queue service unavailable")
+
+    queue_length = await queue_manager.get_queue_length(user_id)
+    is_processing = await queue_manager.is_processing(user_id)
+    current_message_id = await queue_manager.get_current_message_id(user_id)
+
+    logger.debug(
+        "Queue status response",
+        extra={
+            "user_id": user_id,
+            "queue_length": queue_length,
+            "is_processing": is_processing,
+            "current_message_id": current_message_id,
+        },
+    )
 
     return QueueStatusResponse(
         user_id=user_id,
-        queue_length=await queue_manager.get_queue_length(user_id),
-        is_processing=await queue_manager.is_processing(user_id),
-        current_message_id=await queue_manager.get_current_message_id(user_id),
+        queue_length=queue_length,
+        is_processing=is_processing,
+        current_message_id=current_message_id,
     )
 
 

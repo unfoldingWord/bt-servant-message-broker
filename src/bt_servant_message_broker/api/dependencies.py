@@ -1,5 +1,6 @@
 """FastAPI dependencies for authentication and rate limiting."""
 
+import logging
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, Request, status
@@ -8,6 +9,8 @@ from bt_servant_message_broker.config import Settings, get_settings
 from bt_servant_message_broker.services.message_processor import MessageProcessor
 from bt_servant_message_broker.services.queue_manager import QueueManager
 from bt_servant_message_broker.services.worker_client import WorkerClient
+
+logger = logging.getLogger(__name__)
 
 
 def verify_api_key(
@@ -28,15 +31,18 @@ def verify_api_key(
     """
     if not settings.broker_api_key:
         # Auth disabled if no key configured
+        logger.debug("Auth disabled (no BROKER_API_KEY configured)")
         return ""
 
     if not x_api_key:
+        logger.warning("Authentication failed: missing X-API-Key header")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing X-API-Key header",
         )
 
     if x_api_key != settings.broker_api_key:
+        logger.warning("Authentication failed: invalid API key")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API key",

@@ -1,9 +1,12 @@
 """Redis queue operations for per-user message ordering."""
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # Lua script for atomic dequeue operation
@@ -150,6 +153,16 @@ class QueueManager:
         # Store message metadata for debugging/monitoring
         await self._redis.hset(message_key, mapping=metadata)
 
+        logger.info(
+            "Enqueued message",
+            extra={
+                "user_id": user_id,
+                "message_id": message_id,
+                "queue_position": position,
+                "client_id": metadata.get("client_id"),
+            },
+        )
+
         return position
 
     async def dequeue(self, user_id: str) -> tuple[str, str] | None:
@@ -177,6 +190,10 @@ class QueueManager:
         )
 
         if entry is None:
+            logger.debug(
+                "Dequeue returned None (user busy or queue empty)",
+                extra={"user_id": user_id},
+            )
             return None
 
         # Parse the queue entry
@@ -188,6 +205,18 @@ class QueueManager:
         message_key = self._message_key(message_id)
         started_at = datetime.now(timezone.utc).isoformat()
         await self._redis.hset(message_key, "started_at", started_at)
+
+        # Get remaining queue length for logging
+        remaining = await self.get_queue_length(user_id)
+
+        logger.info(
+            "Dequeued message for processing",
+            extra={
+                "user_id": user_id,
+                "message_id": message_id,
+                "remaining_in_queue": remaining,
+            },
+        )
 
         return (message_id, message_data)
 
@@ -215,7 +244,19 @@ class QueueManager:
             args=[message_id],
         )
 
-        return result == 1
+        success = result == 1
+        if success:
+            logger.info(
+                "Marked message complete",
+                extra={"user_id": user_id, "message_id": message_id},
+            )
+        else:
+            logger.warning(
+                "Failed to mark message complete (stale or already cleared)",
+                extra={"user_id": user_id, "message_id": message_id},
+            )
+
+        return success
 
     async def get_queue_length(self, user_id: str) -> int:
         """Get the number of messages in a user's queue.
