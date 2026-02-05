@@ -22,7 +22,12 @@ class ClientId(str, Enum):
 
 
 class MessageRequest(BaseModel):
-    """Request body for POST /api/v1/message."""
+    """Request body for POST /api/v1/message.
+
+    TODO(review): Add model_validator to enforce audio-specific requirements:
+    - When message_type="audio", require audio_base64 and audio_format
+    - When message_type="audio", allow empty message field
+    """
 
     user_id: str = Field(..., description="Unique user identifier")
     org_id: str = Field(..., description="Organization identifier")

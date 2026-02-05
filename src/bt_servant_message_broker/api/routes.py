@@ -51,10 +51,14 @@ async def get_queue_status(
 @router.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
     """Health check endpoint with queue statistics."""
-    # TODO: Add Redis health check in Phase 2
+    # TODO(phase-2): Add actual Redis health check
+    redis_connected = False  # Will be set by QueueManager in Phase 2
+    active_queues = 0
+    messages_processing = 0
+
     return HealthResponse(
-        status="healthy",
-        redis_connected=False,
-        active_queues=0,
-        messages_processing=0,
+        status="healthy" if redis_connected else "degraded",
+        redis_connected=redis_connected,
+        active_queues=active_queues,
+        messages_processing=messages_processing,
     )

@@ -24,6 +24,15 @@ class TestHealthEndpoint:
         assert "active_queues" in data
         assert "messages_processing" in data
 
+    def test_health_returns_degraded_without_redis(self) -> None:
+        """Test that health returns degraded when Redis is not connected."""
+        client = TestClient(app)
+        response = client.get("/health")
+        data = response.json()
+        # Without Redis connection, status should be degraded
+        assert data["status"] == "degraded"
+        assert data["redis_connected"] is False
+
 
 class TestMessageEndpoint:
     """Tests for the POST /api/v1/message endpoint."""
