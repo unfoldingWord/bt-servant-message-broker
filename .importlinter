@@ -1,0 +1,35 @@
+[importlinter]
+root_package = bt_servant_message_broker
+root_package_path = src/bt_servant_message_broker
+
+[importlinter:layering]
+name = Layered architecture (api -> services -> models)
+type = layers
+layers =
+    bt_servant_message_broker.api
+    bt_servant_message_broker.services
+    bt_servant_message_broker.models
+
+[importlinter:no_api_to_utils]
+name = API must not import utils directly (use services)
+type = forbidden
+source_modules =
+    bt_servant_message_broker.api
+forbidden_modules =
+    bt_servant_message_broker.utils
+
+[importlinter:no_models_to_services]
+name = Models must not import services
+type = forbidden
+source_modules =
+    bt_servant_message_broker.models
+forbidden_modules =
+    bt_servant_message_broker.services
+
+[importlinter:no_models_to_api]
+name = Models must not import API
+type = forbidden
+source_modules =
+    bt_servant_message_broker.models
+forbidden_modules =
+    bt_servant_message_broker.api

@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - "**"
+  push:
+    branches:
+      - main
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PYTHONPATH: "${{ github.workspace }}/src"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff (format check)
+        run: ruff format --check src/bt_servant_message_broker tests
+
+      - name: Ruff (lint)
+        run: ruff check .
+
+      - name: Mypy
+        run: mypy .
+
+      - name: Pyright
+        run: pyright --warnings
+
+      - name: Import Linter
+        run: lint-imports
+
+      - name: Bandit
+        run: bandit -q -r src/bt_servant_message_broker
+
+      - name: Pip Audit
+        run: pip-audit
+
+      - name: Deptry
+        run: deptry .
+
+      - name: Pytest (coverage)
+        run: pytest --maxfail=1 --disable-warnings -q --cov=bt_servant_message_broker --cov-report=term-missing --cov-fail-under=65

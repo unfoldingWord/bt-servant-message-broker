@@ -1,0 +1,75 @@
+repos:
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.0.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert]
+
+  - repo: local
+    hooks:
+      - id: ruff-lint
+        name: ruff (lint)
+        entry: ruff check .
+        language: system
+        pass_filenames: false
+        stages: [commit]
+
+      - id: ruff-format
+        name: ruff (format)
+        entry: ruff format --check src/bt_servant_message_broker tests
+        language: system
+        pass_filenames: false
+        stages: [commit]
+
+      - id: mypy
+        name: mypy (types)
+        entry: mypy .
+        language: system
+        pass_filenames: false
+        stages: [commit]
+
+      - id: pyright
+        name: pyright (types)
+        entry: pyright
+        language: system
+        pass_filenames: false
+        stages: [commit]
+
+      - id: import-linter
+        name: import-linter (architecture)
+        entry: lint-imports
+        language: system
+        pass_filenames: false
+        stages: [commit]
+
+      - id: bandit
+        name: bandit (security)
+        entry: bandit -q -r src/bt_servant_message_broker
+        language: system
+        pass_filenames: false
+        stages: [push]
+
+      - id: pip-audit
+        name: pip-audit (supply chain)
+        entry: pip-audit
+        language: system
+        pass_filenames: false
+        stages: [push]
+
+      - id: deptry
+        name: deptry (dependency hygiene)
+        entry: deptry .
+        language: system
+        pass_filenames: false
+        stages: [push]
+
+      - id: pytest
+        name: pytest (with coverage threshold)
+        entry: >-
+          bash -lc '
+            pytest --maxfail=1 --disable-warnings -q --cov=bt_servant_message_broker --cov-report=term-missing --cov-fail-under=65
+          '
+        language: system
+        pass_filenames: false
+        stages: [push]
