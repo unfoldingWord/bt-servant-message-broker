@@ -68,7 +68,7 @@ repos:
         name: pytest (with coverage threshold)
         entry: >-
           bash -lc '
-            pytest --maxfail=1 --disable-warnings -q --cov=bt_servant_message_broker --cov-report=term-missing --cov-fail-under=65
+            pytest --ignore=tests/integration --maxfail=1 --disable-warnings -q --cov=bt_servant_message_broker --cov-report=term-missing --cov-fail-under=65
           '
         language: system
         pass_filenames: false

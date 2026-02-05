@@ -2,9 +2,10 @@
 
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 
 from bt_servant_message_broker.config import Settings, get_settings
+from bt_servant_message_broker.services.queue_manager import QueueManager
 
 
 def verify_api_key(
@@ -42,5 +43,20 @@ def verify_api_key(
     return x_api_key
 
 
+def get_queue_manager(request: Request) -> QueueManager | None:
+    """Get the QueueManager from app state.
+
+    Args:
+        request: FastAPI request object.
+
+    Returns:
+        QueueManager instance or None if Redis unavailable.
+    """
+    return getattr(request.app.state, "queue_manager", None)
+
+
 # Dependency for protected routes
 RequireApiKey = Annotated[str, Depends(verify_api_key)]
+
+# Dependency for queue operations
+RequireQueueManager = Annotated[QueueManager | None, Depends(get_queue_manager)]

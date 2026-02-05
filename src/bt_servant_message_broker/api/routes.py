@@ -1,14 +1,18 @@
 """API route definitions for the message broker."""
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
-from bt_servant_message_broker.api.dependencies import RequireApiKey
+from bt_servant_message_broker.api.dependencies import (
+    RequireApiKey,
+    RequireQueueManager,
+)
 from bt_servant_message_broker.models import (
     HealthResponse,
     MessageRequest,
     QueuedResponse,
     QueueStatusResponse,
 )
+from bt_servant_message_broker.services.queue_manager import QueueManager
 
 router = APIRouter()
 
@@ -17,19 +21,23 @@ router = APIRouter()
 async def submit_message(
     request: MessageRequest,
     _api_key: RequireApiKey,
+    queue_manager: RequireQueueManager,
 ) -> QueuedResponse:
     """Submit a message for processing.
 
     The message is queued and processed in FIFO order per user.
     """
-    # TODO: Implement in Phase 2
-    # 1. Generate message_id
-    # 2. Enqueue message
-    # 3. Return queue position
+    if queue_manager is None:
+        raise HTTPException(status_code=503, detail="Queue service unavailable")
+
+    message_id = QueueManager.generate_message_id()
+    message_data = request.model_dump_json()
+    position = await queue_manager.enqueue(request.user_id, message_id, message_data)
+
     return QueuedResponse(
         status="queued",
-        queue_position=1,
-        message_id="placeholder",
+        queue_position=position,
+        message_id=message_id,
     )
 
 
@@ -37,28 +45,46 @@ async def submit_message(
 async def get_queue_status(
     user_id: str,
     _api_key: RequireApiKey,
+    queue_manager: RequireQueueManager,
 ) -> QueueStatusResponse:
     """Get the queue status for a user."""
-    # TODO: Implement in Phase 2
+    if queue_manager is None:
+        raise HTTPException(status_code=503, detail="Queue service unavailable")
+
     return QueueStatusResponse(
         user_id=user_id,
-        queue_length=0,
-        is_processing=False,
-        current_message_id=None,
+        queue_length=await queue_manager.get_queue_length(user_id),
+        is_processing=await queue_manager.is_processing(user_id),
+        current_message_id=await queue_manager.get_current_message_id(user_id),
     )
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health_check() -> HealthResponse:
+async def health_check(queue_manager: RequireQueueManager) -> HealthResponse:
     """Health check endpoint with queue statistics."""
-    # TODO(phase-2): Add actual Redis health check
-    redis_connected = False  # Will be set by QueueManager in Phase 2
-    active_queues = 0
-    messages_processing = 0
+    if queue_manager is None:
+        return HealthResponse(
+            status="degraded",
+            redis_connected=False,
+            active_queues=0,
+            messages_processing=0,
+        )
 
-    return HealthResponse(
-        status="healthy" if redis_connected else "degraded",
-        redis_connected=redis_connected,
-        active_queues=active_queues,
-        messages_processing=messages_processing,
-    )
+    try:
+        redis_ok = await queue_manager.ping()
+        active = await queue_manager.get_active_queue_count()
+        processing = await queue_manager.get_processing_count()
+
+        return HealthResponse(
+            status="healthy" if redis_ok else "degraded",
+            redis_connected=redis_ok,
+            active_queues=active,
+            messages_processing=processing,
+        )
+    except Exception:
+        return HealthResponse(
+            status="unhealthy",
+            redis_connected=False,
+            active_queues=0,
+            messages_processing=0,
+        )
