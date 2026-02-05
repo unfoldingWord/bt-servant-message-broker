@@ -100,10 +100,78 @@ class TestQueueLifecycle:
 
         assert await real_queue_manager.is_processing("user1") is True
 
-        await real_queue_manager.mark_complete("user1", "msg1")
+        result = await real_queue_manager.mark_complete("user1", "msg1")
+        assert result is True
 
         assert await real_queue_manager.is_processing("user1") is False
         assert await real_queue_manager.get_current_message_id("user1") is None
+
+
+class TestAtomicDequeue:
+    """Integration tests for atomic dequeue behavior."""
+
+    async def test_dequeue_blocked_while_processing(self, real_queue_manager: QueueManager) -> None:
+        """Test that dequeue returns None if user already has a message processing."""
+        await real_queue_manager.enqueue("user1", "msg1", '{"order":1}')
+        await real_queue_manager.enqueue("user1", "msg2", '{"order":2}')
+
+        # First dequeue succeeds
+        result1 = await real_queue_manager.dequeue("user1")
+        assert result1 is not None
+        assert result1[0] == "msg1"
+
+        # Second dequeue blocked - user already processing
+        result2 = await real_queue_manager.dequeue("user1")
+        assert result2 is None
+
+        # After mark_complete, can dequeue again
+        await real_queue_manager.mark_complete("user1", "msg1")
+        result3 = await real_queue_manager.dequeue("user1")
+        assert result3 is not None
+        assert result3[0] == "msg2"
+
+    async def test_mark_complete_compare_and_delete(self, real_queue_manager: QueueManager) -> None:
+        """Test that mark_complete only clears if message ID matches."""
+        await real_queue_manager.enqueue("user1", "msg1", "{}")
+        await real_queue_manager.dequeue("user1")
+
+        # Try to complete with wrong message ID (stale worker scenario)
+        result = await real_queue_manager.mark_complete("user1", "wrong_msg_id")
+        assert result is False
+
+        # Processing flag should still be set
+        assert await real_queue_manager.is_processing("user1") is True
+
+        # Correct message ID works
+        result = await real_queue_manager.mark_complete("user1", "msg1")
+        assert result is True
+        assert await real_queue_manager.is_processing("user1") is False
+
+
+class TestMetadata:
+    """Integration tests for message metadata."""
+
+    async def test_metadata_includes_client_id(
+        self, real_queue_manager: QueueManager, real_redis: Any
+    ) -> None:
+        """Test that metadata includes client_id from message_data."""
+        message_data = '{"client_id": "web", "message": "hello"}'
+        await real_queue_manager.enqueue("user1", "msg1", message_data)
+
+        metadata = await real_redis.hgetall("message:msg1")
+        assert metadata["client_id"] == "web"
+        assert metadata["user_id"] == "user1"
+        assert "queued_at" in metadata
+
+    async def test_metadata_includes_callback_url(
+        self, real_queue_manager: QueueManager, real_redis: Any
+    ) -> None:
+        """Test that metadata includes callback_url from message_data."""
+        message_data = '{"callback_url": "https://example.com/callback"}'
+        await real_queue_manager.enqueue("user1", "msg1", message_data)
+
+        metadata = await real_redis.hgetall("message:msg1")
+        assert metadata["callback_url"] == "https://example.com/callback"
 
 
 class TestMultipleUsers:
@@ -127,6 +195,11 @@ class TestMultipleUsers:
 
         assert await real_queue_manager.is_processing("user1") is True
         assert await real_queue_manager.is_processing("user2") is False
+
+        # User2 can still dequeue while user1 is processing
+        result = await real_queue_manager.dequeue("user2")
+        assert result is not None
+        assert result[0] == "msg2"
 
 
 class TestStatistics:

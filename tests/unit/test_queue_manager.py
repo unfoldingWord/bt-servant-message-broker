@@ -4,6 +4,7 @@ import json
 from unittest.mock import AsyncMock
 
 from bt_servant_message_broker.services.queue_manager import QueueManager
+from tests.conftest import make_queue_entry
 
 
 class TestGenerateMessageId:
@@ -72,72 +73,123 @@ class TestEnqueue:
         assert "user_id" in call_args[1]["mapping"]
         assert "queued_at" in call_args[1]["mapping"]
 
+    async def test_stores_client_id_in_metadata(
+        self, queue_manager: QueueManager, mock_redis: AsyncMock
+    ) -> None:
+        """Test that enqueue extracts client_id from message_data."""
+        message_data = '{"client_id": "web", "message": "hello"}'
+        await queue_manager.enqueue("user1", "msg1", message_data)
+        call_args = mock_redis.hset.call_args
+        assert call_args[1]["mapping"]["client_id"] == "web"
+
+    async def test_stores_callback_url_in_metadata(
+        self, queue_manager: QueueManager, mock_redis: AsyncMock
+    ) -> None:
+        """Test that enqueue extracts callback_url from message_data."""
+        message_data = '{"callback_url": "https://example.com/callback"}'
+        await queue_manager.enqueue("user1", "msg1", message_data)
+        call_args = mock_redis.hset.call_args
+        assert call_args[1]["mapping"]["callback_url"] == "https://example.com/callback"
+
+    async def test_skips_null_callback_url(
+        self, queue_manager: QueueManager, mock_redis: AsyncMock
+    ) -> None:
+        """Test that enqueue skips null callback_url."""
+        message_data = '{"callback_url": null}'
+        await queue_manager.enqueue("user1", "msg1", message_data)
+        call_args = mock_redis.hset.call_args
+        assert "callback_url" not in call_args[1]["mapping"]
+
 
 class TestDequeue:
     """Tests for dequeue method."""
 
     async def test_empty_queue_returns_none(
-        self, queue_manager: QueueManager, mock_redis: AsyncMock
+        self, queue_manager: QueueManager, mock_dequeue_script: AsyncMock
     ) -> None:
         """Test that dequeue returns None for empty queue."""
-        mock_redis.lpop.return_value = None
+        mock_dequeue_script.return_value = None
         result = await queue_manager.dequeue("user1")
         assert result is None
 
     async def test_returns_message_tuple(
-        self, queue_manager: QueueManager, mock_redis: AsyncMock
+        self,
+        queue_manager: QueueManager,
+        mock_redis: AsyncMock,
+        mock_dequeue_script: AsyncMock,
     ) -> None:
         """Test that dequeue returns (message_id, message_data) tuple."""
-        mock_redis.lpop.return_value = json.dumps({"id": "msg1", "data": '{"test":1}'})
+        mock_dequeue_script.return_value = make_queue_entry("msg1", '{"test":1}')
         result = await queue_manager.dequeue("user1")
         assert result is not None
         assert result[0] == "msg1"
         assert result[1] == '{"test":1}'
 
-    async def test_sets_processing_flag(
-        self, queue_manager: QueueManager, mock_redis: AsyncMock
+    async def test_already_processing_returns_none(
+        self, queue_manager: QueueManager, mock_dequeue_script: AsyncMock
     ) -> None:
-        """Test that dequeue sets processing flag with TTL."""
-        mock_redis.lpop.return_value = json.dumps({"id": "msg1", "data": "{}"})
-        await queue_manager.dequeue("user1")
-        mock_redis.setex.assert_called_once()
-        call_args = mock_redis.setex.call_args
-        assert call_args[0][0] == "user:user1:processing"
-        assert call_args[0][1] == QueueManager.PROCESSING_TTL
-        assert call_args[0][2] == "msg1"
+        """Test that dequeue returns None when user already has a message processing."""
+        # Lua script returns None when processing flag exists
+        mock_dequeue_script.return_value = None
+        result = await queue_manager.dequeue("user1")
+        assert result is None
 
-    async def test_updates_message_metadata(
-        self, queue_manager: QueueManager, mock_redis: AsyncMock
+    async def test_updates_message_metadata_with_started_at(
+        self,
+        queue_manager: QueueManager,
+        mock_redis: AsyncMock,
+        mock_dequeue_script: AsyncMock,
     ) -> None:
         """Test that dequeue updates message metadata with started_at."""
-        mock_redis.lpop.return_value = json.dumps({"id": "msg1", "data": "{}"})
+        mock_dequeue_script.return_value = make_queue_entry("msg1", "{}")
         await queue_manager.dequeue("user1")
         # hset should be called to update started_at
         call_args = mock_redis.hset.call_args
         assert call_args[0][0] == "message:msg1"
         assert call_args[0][1] == "started_at"
 
+    async def test_script_called_with_correct_keys(
+        self,
+        queue_manager: QueueManager,
+        mock_dequeue_script: AsyncMock,
+    ) -> None:
+        """Test that dequeue calls script with correct Redis keys."""
+        mock_dequeue_script.return_value = None
+        await queue_manager.dequeue("user1")
+        mock_dequeue_script.assert_called_once()
+        call_kwargs = mock_dequeue_script.call_args[1]
+        assert call_kwargs["keys"] == ["user:user1:queue", "user:user1:processing"]
+        assert call_kwargs["args"] == [QueueManager.PROCESSING_TTL]
+
 
 class TestMarkComplete:
     """Tests for mark_complete method."""
 
-    async def test_deletes_processing_flag(
-        self, queue_manager: QueueManager, mock_redis: AsyncMock
+    async def test_returns_true_on_success(
+        self, queue_manager: QueueManager, mock_mark_complete_script: AsyncMock
     ) -> None:
-        """Test that mark_complete deletes processing flag."""
-        await queue_manager.mark_complete("user1", "msg1")
-        calls = mock_redis.delete.call_args_list
-        keys_deleted = [call[0][0] for call in calls]
-        assert "user:user1:processing" in keys_deleted
+        """Test that mark_complete returns True when message ID matches."""
+        mock_mark_complete_script.return_value = 1
+        result = await queue_manager.mark_complete("user1", "msg1")
+        assert result is True
 
-    async def test_deletes_message_metadata(
-        self, queue_manager: QueueManager, mock_redis: AsyncMock
+    async def test_returns_false_on_stale_worker(
+        self, queue_manager: QueueManager, mock_mark_complete_script: AsyncMock
     ) -> None:
-        """Test that mark_complete cleans up message metadata."""
+        """Test that mark_complete returns False when message ID doesn't match."""
+        mock_mark_complete_script.return_value = 0
+        result = await queue_manager.mark_complete("user1", "msg1")
+        assert result is False
+
+    async def test_script_called_with_correct_keys(
+        self, queue_manager: QueueManager, mock_mark_complete_script: AsyncMock
+    ) -> None:
+        """Test that mark_complete calls script with correct Redis keys."""
         await queue_manager.mark_complete("user1", "msg1")
-        calls = mock_redis.delete.call_args_list
-        keys_deleted = [call[0][0] for call in calls]
-        assert "message:msg1" in keys_deleted
+        mock_mark_complete_script.assert_called_once()
+        call_kwargs = mock_mark_complete_script.call_args[1]
+        assert call_kwargs["keys"] == ["user:user1:processing", "message:msg1"]
+        assert call_kwargs["args"] == ["msg1"]
 
 
 class TestGetQueueLength:
@@ -266,26 +318,41 @@ class TestPing:
         assert result is False
 
 
-class TestFifoOrdering:
-    """Tests for FIFO ordering behavior."""
+class TestAtomicOperations:
+    """Tests for atomic operation guarantees."""
 
-    async def test_messages_dequeued_in_order(
-        self, queue_manager: QueueManager, mock_redis: AsyncMock
+    async def test_dequeue_is_atomic(
+        self, queue_manager: QueueManager, mock_dequeue_script: AsyncMock
     ) -> None:
-        """Test that messages are dequeued in FIFO order."""
-        # Simulate three messages in queue
-        messages = [
-            json.dumps({"id": "msg1", "data": '{"order":1}'}),
-            json.dumps({"id": "msg2", "data": '{"order":2}'}),
-            json.dumps({"id": "msg3", "data": '{"order":3}'}),
-        ]
-        mock_redis.lpop.side_effect = messages
+        """Test that dequeue uses atomic Lua script."""
+        mock_dequeue_script.return_value = make_queue_entry("msg1", "{}")
+        await queue_manager.dequeue("user1")
+        # Script should be called exactly once (atomic operation)
+        mock_dequeue_script.assert_called_once()
 
-        # Dequeue should return in order
+    async def test_mark_complete_is_atomic(
+        self, queue_manager: QueueManager, mock_mark_complete_script: AsyncMock
+    ) -> None:
+        """Test that mark_complete uses atomic Lua script."""
+        mock_mark_complete_script.return_value = 1
+        await queue_manager.mark_complete("user1", "msg1")
+        # Script should be called exactly once (atomic operation)
+        mock_mark_complete_script.assert_called_once()
+
+    async def test_concurrent_dequeue_blocked_by_processing_flag(
+        self, queue_manager: QueueManager, mock_dequeue_script: AsyncMock
+    ) -> None:
+        """Test that concurrent dequeue is blocked when already processing.
+
+        The Lua script checks EXISTS on processing flag before LPOP,
+        so if another worker is processing, dequeue returns None.
+        """
+        # First dequeue succeeds
+        mock_dequeue_script.return_value = make_queue_entry("msg1", "{}")
         result1 = await queue_manager.dequeue("user1")
-        result2 = await queue_manager.dequeue("user1")
-        result3 = await queue_manager.dequeue("user1")
+        assert result1 is not None
 
-        assert result1 is not None and result1[0] == "msg1"
-        assert result2 is not None and result2[0] == "msg2"
-        assert result3 is not None and result3[0] == "msg3"
+        # Second dequeue returns None (processing flag exists in Lua script)
+        mock_dequeue_script.return_value = None
+        result2 = await queue_manager.dequeue("user1")
+        assert result2 is None

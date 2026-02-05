@@ -1,8 +1,9 @@
 """Pytest fixtures and configuration."""
 
+import json
 import os
 from collections.abc import Iterator
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -36,7 +37,11 @@ def client() -> TestClient:
 
 @pytest.fixture
 def mock_redis() -> AsyncMock:
-    """Mock Redis client for unit tests."""
+    """Mock Redis client for unit tests.
+
+    Includes support for Lua script registration used by QueueManager
+    for atomic operations.
+    """
     redis = AsyncMock()
     redis.ping = AsyncMock(return_value=True)
     redis.rpush = AsyncMock(return_value=1)
@@ -48,6 +53,17 @@ def mock_redis() -> AsyncMock:
     redis.delete = AsyncMock()
     redis.hset = AsyncMock()
     redis.scan = AsyncMock(return_value=(0, []))
+
+    # Mock for Lua script registration
+    # The script object is callable and returns whatever we configure
+    def create_mock_script(script_content: str) -> AsyncMock:
+        mock_script = AsyncMock()
+        # Default return value is None (empty queue / already processing)
+        mock_script.return_value = None
+        return mock_script
+
+    redis.register_script = MagicMock(side_effect=create_mock_script)
+
     return redis
 
 
@@ -55,3 +71,58 @@ def mock_redis() -> AsyncMock:
 def queue_manager(mock_redis: AsyncMock) -> QueueManager:
     """QueueManager with mocked Redis."""
     return QueueManager(mock_redis)
+
+
+@pytest.fixture
+def mock_dequeue_script(mock_redis: AsyncMock) -> AsyncMock:
+    """Get the mock dequeue script for configuring test behavior.
+
+    Use this fixture to configure what the dequeue Lua script returns.
+
+    Example:
+        mock_dequeue_script.return_value = json.dumps({"id": "msg1", "data": "{}"})
+    """
+    # Create a fresh script mock that we can configure
+    script = AsyncMock()
+    script.return_value = None
+
+    # Make register_script return our configurable mock for dequeue
+    original_side_effect = mock_redis.register_script.side_effect
+
+    def custom_register(script_content: str) -> AsyncMock:
+        if "LPOP" in script_content:
+            return script
+        # For other scripts, use original behavior
+        return original_side_effect(script_content)
+
+    mock_redis.register_script = MagicMock(side_effect=custom_register)
+    return script
+
+
+@pytest.fixture
+def mock_mark_complete_script(mock_redis: AsyncMock) -> AsyncMock:
+    """Get the mock mark_complete script for configuring test behavior.
+
+    Use this fixture to configure what the mark_complete Lua script returns.
+
+    Example:
+        mock_mark_complete_script.return_value = 1  # Success
+        mock_mark_complete_script.return_value = 0  # Stale worker
+    """
+    script = AsyncMock()
+    script.return_value = 1  # Default to success
+
+    original_side_effect = mock_redis.register_script.side_effect
+
+    def custom_register(script_content: str) -> AsyncMock:
+        if "Compare-and-delete" in script_content or "expected_message_id" in script_content:
+            return script
+        return original_side_effect(script_content)
+
+    mock_redis.register_script = MagicMock(side_effect=custom_register)
+    return script
+
+
+def make_queue_entry(message_id: str, data: str) -> str:
+    """Helper to create a queue entry JSON string."""
+    return json.dumps({"id": message_id, "data": data})

@@ -16,12 +16,66 @@ user:{user_id}:queue → ["msg_json_1", "msg_json_2", ...]
 # Currently processing flag (Redis STRING with TTL: 300s)
 user:{user_id}:processing → "msg_id"
 
-# Message metadata (Redis HASH)
+# Message metadata (Redis HASH) - per PRD schema
 message:{msg_id} → {
   "user_id": "...",
+  "client_id": "...",        # Extracted from message_data
+  "callback_url": "...",     # Extracted from message_data (if present)
   "queued_at": "...",
   "started_at": "...",
 }
+```
+
+## Atomic Operations (Lua Scripts)
+
+To prevent race conditions and ensure data integrity, the following operations use Redis Lua scripts:
+
+### Dequeue Script
+Atomically checks processing flag, pops message, and sets processing flag:
+```lua
+-- Returns: message entry JSON, or nil if queue empty or already processing
+local queue_key = KEYS[1]
+local processing_key = KEYS[2]
+local ttl = ARGV[1]
+
+-- Check if already processing (strict FIFO: one message at a time per user)
+if redis.call('EXISTS', processing_key) == 1 then
+    return nil
+end
+
+-- Pop the next message
+local entry = redis.call('LPOP', queue_key)
+if not entry then
+    return nil
+end
+
+-- Parse to get message ID for processing flag
+local parsed = cjson.decode(entry)
+local message_id = parsed['id']
+
+-- Set processing flag atomically
+redis.call('SETEX', processing_key, ttl, message_id)
+
+return entry
+```
+
+### Mark Complete Script
+Atomically verifies message ID before clearing (prevents stale workers):
+```lua
+-- Returns: 1 if cleared, 0 if message ID didn't match
+local processing_key = KEYS[1]
+local message_key = KEYS[2]
+local expected_message_id = ARGV[1]
+
+-- Compare-and-delete: only clear if message ID matches
+local current_id = redis.call('GET', processing_key)
+if current_id == expected_message_id then
+    redis.call('DEL', processing_key)
+    redis.call('DEL', message_key)
+    return 1
+end
+
+return 0
 ```
 
 ## Files to Modify
