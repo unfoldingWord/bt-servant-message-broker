@@ -80,10 +80,16 @@ typeCheckingMode = "strict"
 reportMissingTypeStubs = false
 
 [tool.pytest.ini_options]
-addopts = "-q --maxfail=1 --disable-warnings"
+addopts = "-q --maxfail=1"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "ignore::pytest.PytestUnknownMarkWarning",
+]
+markers = [
+    "integration: marks tests as integration tests (require Redis)",
+]
 
 [tool.deptry]
 ignore_notebooks = true

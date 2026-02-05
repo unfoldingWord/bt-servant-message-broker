@@ -1,12 +1,14 @@
 """FastAPI application entry point."""
 
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI
+from redis.asyncio import Redis
 
 from bt_servant_message_broker.api.routes import router
 from bt_servant_message_broker.config import get_settings
+from bt_servant_message_broker.services.queue_manager import QueueManager
 from bt_servant_message_broker.utils.logging import get_logger, setup_logging
 
 
@@ -18,12 +20,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger = get_logger(__name__)
     logger.info("Starting bt-servant-message-broker")
 
-    # TODO: Initialize Redis connection in Phase 2
-    # TODO: Initialize worker client in Phase 3
+    # Initialize Redis connection
+    redis_client: Any = None
+    queue_manager: QueueManager | None = None
+
+    try:
+        redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
+        await redis_client.ping()
+        queue_manager = QueueManager(redis_client)
+        logger.info("Redis connected successfully")
+    except Exception as e:
+        logger.warning("Redis connection failed: %s", e)
+
+    # Store in app.state for dependency access
+    app.state.redis = redis_client
+    app.state.queue_manager = queue_manager
 
     yield
 
     # Cleanup
+    if redis_client:
+        await redis_client.close()
     logger.info("Shutting down bt-servant-message-broker")
 
 
