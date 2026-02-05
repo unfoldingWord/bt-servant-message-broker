@@ -99,8 +99,8 @@ pep621_dev_dependency_groups = ["dev"]
 
 [tool.deptry.per_rule_ignores]
 # uvicorn: CLI entrypoint, not imported
-# httpx, redis, sse-starlette: Used in Phase 2-4 implementations (currently stubs)
-DEP002 = ["uvicorn", "httpx", "redis", "sse-starlette"]
+# sse-starlette: Used in Phase 4 implementation (currently stubs)
+DEP002 = ["uvicorn", "sse-starlette"]
 
 [tool.pylint.similarities]
 min-similarity-lines = 1000

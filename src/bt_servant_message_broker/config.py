@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     # Worker connection
     worker_base_url: str = "http://localhost:8787"
     worker_api_key: str = ""
+    worker_timeout: float = 60.0  # seconds
 
     # Broker auth
     broker_api_key: str = ""

@@ -8,7 +8,9 @@ from redis.asyncio import Redis
 
 from bt_servant_message_broker.api.routes import router
 from bt_servant_message_broker.config import get_settings
+from bt_servant_message_broker.services.message_processor import MessageProcessor
 from bt_servant_message_broker.services.queue_manager import QueueManager
+from bt_servant_message_broker.services.worker_client import WorkerClient
 from bt_servant_message_broker.utils.logging import get_logger, setup_logging
 
 
@@ -32,13 +34,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as e:
         logger.warning("Redis connection failed: %s", e)
 
+    # Initialize WorkerClient and MessageProcessor
+    worker_client: WorkerClient | None = None
+    message_processor: MessageProcessor | None = None
+
+    if settings.worker_base_url and settings.worker_api_key:
+        worker_client = WorkerClient(
+            base_url=settings.worker_base_url,
+            api_key=settings.worker_api_key,
+            timeout=settings.worker_timeout,
+        )
+        logger.info("WorkerClient initialized for %s", settings.worker_base_url)
+
+        if queue_manager:
+            message_processor = MessageProcessor(queue_manager, worker_client)
+            logger.info("MessageProcessor initialized")
+    else:
+        logger.warning("Worker not configured (missing WORKER_BASE_URL or WORKER_API_KEY)")
+
     # Store in app.state for dependency access
     app.state.redis = redis_client
     app.state.queue_manager = queue_manager
+    app.state.worker_client = worker_client
+    app.state.message_processor = message_processor
 
     yield
 
     # Cleanup
+    if worker_client:
+        await worker_client.close()
     if redis_client:
         await redis_client.close()
     logger.info("Shutting down bt-servant-message-broker")

@@ -57,6 +57,17 @@ class QueueStatusResponse(BaseModel):
     current_message_id: str | None = None
 
 
+class MessageResponse(BaseModel):
+    """Union response - either queued or completed."""
+
+    status: Literal["queued", "completed"]
+    message_id: str
+    queue_position: int | None = None  # Only for queued
+    responses: list[str] | None = None  # Only for completed
+    response_language: str | None = None  # Only for completed
+    voice_audio_base64: str | None = None  # Only for completed
+
+
 class HealthResponse(BaseModel):
     """Response for GET /health."""
 
@@ -64,3 +75,4 @@ class HealthResponse(BaseModel):
     redis_connected: bool
     active_queues: int
     messages_processing: int
+    worker_connected: bool = False
