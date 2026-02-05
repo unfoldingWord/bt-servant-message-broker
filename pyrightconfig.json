@@ -1,0 +1,16 @@
+{
+  "include": ["src", "tests"],
+  "exclude": [
+    "**/.venv",
+    "**/.mypy_cache",
+    "**/.pytest_cache",
+    "**/__pycache__"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic",
+  "reportOptionalMemberAccess": "warning",
+  "reportArgumentType": "warning",
+  "reportAssignmentType": "warning"
+}
