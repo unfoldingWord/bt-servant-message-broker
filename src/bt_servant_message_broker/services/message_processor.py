@@ -1,5 +1,6 @@
 """Message processing orchestration layer."""
 
+import asyncio
 import json
 import logging
 
@@ -15,7 +16,8 @@ class MessageProcessor:
     Implements hybrid sync/async processing:
     - Attempts immediate processing only when message is first in queue
     - Returns None if user is busy or message is queued behind others
-    - Does NOT drain queue in request path (avoids latency/recursion issues)
+    - After completing a message, spawns background task to process next
+    - Background tasks are non-blocking and don't add to request latency
     """
 
     def __init__(self, queue_manager: QueueManager, worker_client: WorkerClient) -> None:
@@ -99,6 +101,7 @@ class MessageProcessor:
                 )
             finally:
                 await self._queue.mark_complete(user_id, dequeued_id)
+                self._schedule_next_processing(user_id)
             # Return None so client gets "queued" status (their message is still in queue)
             return None
 
@@ -114,3 +117,56 @@ class MessageProcessor:
         finally:
             # Always mark complete to prevent queue stalling
             await self._queue.mark_complete(user_id, dequeued_id)
+            self._schedule_next_processing(user_id)
+
+    def _schedule_next_processing(self, user_id: str) -> None:
+        """Schedule background task to process next message in queue.
+
+        Uses asyncio.create_task to avoid blocking the current request.
+        Each task processes one message and schedules the next if needed.
+        """
+        asyncio.create_task(self._process_next_message(user_id))
+
+    async def _process_next_message(self, user_id: str) -> None:
+        """Process the next message in queue (background task).
+
+        This runs as a fire-and-forget background task. It processes one
+        message and schedules another task for the next, avoiding recursion.
+        """
+        try:
+            dequeued = await self._queue.dequeue(user_id)
+            if dequeued is None:
+                logger.debug(
+                    "No more messages to process in background",
+                    extra={"user_id": user_id},
+                )
+                return
+
+            message_id, message_data = dequeued
+            logger.info(
+                "Processing queued message in background",
+                extra={"user_id": user_id, "message_id": message_id},
+            )
+
+            try:
+                parsed = json.loads(message_data)
+                await self._worker.send_message(parsed)
+                logger.info(
+                    "Background message processed successfully",
+                    extra={"user_id": user_id, "message_id": message_id},
+                )
+            except Exception as e:
+                logger.error(
+                    "Background message processing failed",
+                    extra={"user_id": user_id, "message_id": message_id, "error": str(e)},
+                )
+            finally:
+                await self._queue.mark_complete(user_id, message_id)
+                # Schedule next message processing (non-recursive: new task)
+                self._schedule_next_processing(user_id)
+
+        except Exception as e:
+            logger.error(
+                "Background processing task failed",
+                extra={"user_id": user_id, "error": str(e)},
+            )

@@ -20,9 +20,15 @@ Client → POST /api/v1/message → Broker
               ↓
          Mark Complete
               ↓
-         Return Response
-              ↓
-         Process next (if any)
+         Return Response ──────────────────────────────────────┐
+              ↓                                                │
+    [Background Task] ← Schedule next processing (non-blocking)│
+              ↓                                                │
+         Try dequeue → Process → Mark Complete → Schedule next │
+                                                               │
+    Note: Background tasks process queued messages without     │
+    blocking the original request. Each task processes one     │
+    message and spawns another task for the next (if any).     │
 ```
 
 ## Key Design Decisions
@@ -30,7 +36,7 @@ Client → POST /api/v1/message → Broker
 1. **Hybrid sync/async**: Attempt immediate processing; return "queued" only if user already has message processing
 2. **Fail fast**: No retries at broker layer - return errors to client who can retry
 3. **Always mark complete**: Even on errors, to prevent queue stalling
-4. **Recursive processing**: After completing a message, automatically process next in queue
+4. **Background queue drain**: After completing a message, spawn a background task to process next in queue (non-blocking, avoids request latency and recursion depth issues)
 
 ## bt-servant-worker API
 
