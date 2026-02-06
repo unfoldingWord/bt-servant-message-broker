@@ -1,9 +1,9 @@
 """Message models based on PRD API design."""
 
 from enum import Enum
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class MessageType(str, Enum):
@@ -22,23 +22,40 @@ class ClientId(str, Enum):
 
 
 class MessageRequest(BaseModel):
-    """Request body for POST /api/v1/message.
-
-    TODO(phase2-review): Add model_validator to enforce audio-specific requirements:
-    - When message_type="audio", require audio_base64 and audio_format
-    - When message_type="audio", allow empty message field
-    This was flagged in Phase 3 code review - deferring to audio feature implementation.
-    """
+    """Request body for POST /api/v1/message."""
 
     user_id: str = Field(..., description="Unique user identifier")
     org_id: str = Field(..., description="Organization identifier")
-    message: str = Field(..., description="Message content")
+    message: str = Field(
+        default="", description="Message content (required for text, optional for audio)"
+    )
     message_type: MessageType = Field(default=MessageType.TEXT, description="Type of message")
     audio_base64: str | None = Field(default=None, description="Base64-encoded audio data")
     audio_format: str | None = Field(default=None, description="Audio format (e.g., 'ogg', 'mp3')")
     client_id: ClientId = Field(..., description="Originating client identifier")
     client_message_id: str | None = Field(default=None, description="Client-side message ID")
     callback_url: str | None = Field(default=None, description="URL for async response delivery")
+
+    @model_validator(mode="after")
+    def validate_audio_requirements(self) -> Self:
+        """Validate audio-specific requirements.
+
+        When message_type is audio:
+        - audio_base64 and audio_format are required
+        - message can be empty
+
+        When message_type is text:
+        - message is required (non-empty)
+        """
+        if self.message_type == MessageType.AUDIO:
+            if not self.audio_base64:
+                raise ValueError("audio_base64 is required when message_type is 'audio'")
+            if not self.audio_format:
+                raise ValueError("audio_format is required when message_type is 'audio'")
+        elif self.message_type == MessageType.TEXT:
+            if not self.message:
+                raise ValueError("message is required when message_type is 'text'")
+        return self
 
 
 class QueuedResponse(BaseModel):
