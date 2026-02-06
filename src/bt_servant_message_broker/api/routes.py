@@ -61,7 +61,7 @@ async def submit_message(
     if message_processor:
         try:
             response = await message_processor.process_message(
-                request.user_id, message_id, message_data
+                request.user_id, message_id, message_data, position
             )
             if response:
                 logger.info(

@@ -13,9 +13,9 @@ class MessageProcessor:
     """Orchestrates message processing through queue and worker.
 
     Implements hybrid sync/async processing:
-    - Attempts immediate processing when user has no pending messages
-    - Returns None if user is busy (message stays queued for later)
-    - Recursively processes next message after completing one
+    - Attempts immediate processing only when message is first in queue
+    - Returns None if user is busy or message is queued behind others
+    - Does NOT drain queue in request path (avoids latency/recursion issues)
     """
 
     def __init__(self, queue_manager: QueueManager, worker_client: WorkerClient) -> None:
@@ -29,89 +29,88 @@ class MessageProcessor:
         self._worker = worker_client
 
     async def process_message(
-        self, user_id: str, message_id: str, message_data: str
+        self, user_id: str, message_id: str, message_data: str, queue_position: int
     ) -> WorkerResponse | None:
-        """Process a message if user is not currently processing.
+        """Process a message if it's first in queue and user is not busy.
 
-        Attempts to dequeue and process the message immediately. If the user
-        already has a message being processed, returns None (message stays queued).
+        Only attempts processing if queue_position is 1 (first in line).
+        This prevents returning responses for the wrong message.
 
         Args:
             user_id: User identifier.
             message_id: Message identifier.
             message_data: JSON-serialized message data.
+            queue_position: Position in queue after enqueue (1-indexed).
 
         Returns:
-            WorkerResponse if processed successfully, None if user is busy.
+            WorkerResponse if processed successfully, None if queued.
 
         Raises:
             WorkerError: If worker communication fails.
             WorkerTimeoutError: If worker request times out.
         """
+        # Only attempt processing if we're first in queue
+        if queue_position > 1:
+            logger.debug(
+                "Message queued behind others",
+                extra={
+                    "user_id": user_id,
+                    "message_id": message_id,
+                    "queue_position": queue_position,
+                },
+            )
+            return None
+
         # Try to dequeue (atomic check + pop)
         dequeued = await self._queue.dequeue(user_id)
         if dequeued is None:
             # User is already processing another message
-            logger.debug("User %s is busy, message %s stays queued", user_id, message_id)
+            logger.debug(
+                "User is busy, message stays queued",
+                extra={"user_id": user_id, "message_id": message_id},
+            )
             return None
 
         dequeued_id, dequeued_data = dequeued
 
-        # Verify we got the expected message (should always match for new messages)
+        # Safety check: verify we got the expected message
+        # If not, we have a race condition - process it but don't return to this client
         if dequeued_id != message_id:
-            logger.warning(
-                "Dequeued message %s doesn't match expected %s for user %s",
-                dequeued_id,
-                message_id,
-                user_id,
+            logger.error(
+                "Message ID mismatch - dequeued different message than expected",
+                extra={
+                    "user_id": user_id,
+                    "expected_message_id": message_id,
+                    "dequeued_message_id": dequeued_id,
+                },
             )
+            # Process the dequeued message but don't return its response to this client
+            try:
+                parsed = json.loads(dequeued_data)
+                await self._worker.send_message(parsed)
+                logger.info(
+                    "Processed mismatched message",
+                    extra={"user_id": user_id, "message_id": dequeued_id},
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to process mismatched message",
+                    extra={"user_id": user_id, "message_id": dequeued_id, "error": str(e)},
+                )
+            finally:
+                await self._queue.mark_complete(user_id, dequeued_id)
+            # Return None so client gets "queued" status (their message is still in queue)
+            return None
 
+        # Process the message
         try:
             parsed = json.loads(dequeued_data)
             response = await self._worker.send_message(parsed)
-            logger.info("Processed message %s for user %s", dequeued_id, user_id)
+            logger.info(
+                "Processed message successfully",
+                extra={"user_id": user_id, "message_id": dequeued_id},
+            )
             return response
         finally:
             # Always mark complete to prevent queue stalling
             await self._queue.mark_complete(user_id, dequeued_id)
-            # Process next message in queue if any
-            await self._process_next(user_id)
-
-    async def _process_next(self, user_id: str) -> None:
-        """Process the next message in the user's queue if available.
-
-        This is called after completing a message to drain the queue.
-        Errors are logged but not raised to prevent cascading failures.
-
-        Args:
-            user_id: User identifier.
-        """
-        # Check if there are more messages
-        queue_length = await self._queue.get_queue_length(user_id)
-        if queue_length == 0:
-            return
-
-        # Try to dequeue next message
-        dequeued = await self._queue.dequeue(user_id)
-        if dequeued is None:
-            # Another worker got it or queue is empty
-            return
-
-        dequeued_id, dequeued_data = dequeued
-
-        try:
-            parsed = json.loads(dequeued_data)
-            await self._worker.send_message(parsed)
-            logger.info("Processed queued message %s for user %s", dequeued_id, user_id)
-        except Exception as e:
-            # Log but don't raise - we don't want to fail the original request
-            logger.error(
-                "Failed to process queued message %s for user %s: %s",
-                dequeued_id,
-                user_id,
-                e,
-            )
-        finally:
-            await self._queue.mark_complete(user_id, dequeued_id)
-            # Recurse to process remaining messages
-            await self._process_next(user_id)

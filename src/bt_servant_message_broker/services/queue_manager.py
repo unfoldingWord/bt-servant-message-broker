@@ -70,15 +70,19 @@ class QueueManager:
         message:{msg_id} - HASH for message metadata
     """
 
-    PROCESSING_TTL = 300  # 5 minutes - prevents stale locks if worker crashes
+    DEFAULT_PROCESSING_TTL = 300  # 5 minutes default
 
-    def __init__(self, redis_client: Any) -> None:
+    def __init__(self, redis_client: Any, processing_ttl: int | None = None) -> None:
         """Initialize the queue manager.
 
         Args:
             redis_client: Async Redis client instance.
+            processing_ttl: TTL in seconds for the processing lock. Should be longer
+                than the worker timeout to prevent lock expiry during processing.
+                Defaults to 300 seconds (5 minutes).
         """
         self._redis: Any = redis_client
+        self._processing_ttl = processing_ttl or self.DEFAULT_PROCESSING_TTL
         self._dequeue_script: Any = None
         self._mark_complete_script: Any = None
 
@@ -186,7 +190,7 @@ class QueueManager:
         script = await self._get_dequeue_script()
         entry: str | None = await script(
             keys=[queue_key, processing_key],
-            args=[self.PROCESSING_TTL],
+            args=[self._processing_ttl],
         )
 
         if entry is None:

@@ -29,7 +29,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
         await redis_client.ping()
-        queue_manager = QueueManager(redis_client)
+        # Set processing TTL to worker_timeout + 60s buffer to prevent lock expiry
+        processing_ttl = int(settings.worker_timeout) + 60
+        queue_manager = QueueManager(redis_client, processing_ttl=processing_ttl)
         logger.info("Redis connected successfully")
     except Exception as e:
         logger.warning("Redis connection failed: %s", e)

@@ -48,13 +48,25 @@ class TestMessageProcessor:
     """Tests for MessageProcessor."""
 
     @pytest.mark.asyncio
+    async def test_process_message_not_first_in_queue(
+        self, processor: MessageProcessor, mock_queue_manager: AsyncMock
+    ) -> None:
+        """Test that None is returned when message is not first in queue."""
+        # queue_position > 1 means we're not first
+        result = await processor.process_message("user1", "msg1", "{}", queue_position=2)
+
+        assert result is None
+        # Should not even try to dequeue
+        mock_queue_manager.dequeue.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_process_message_user_busy(
         self, processor: MessageProcessor, mock_queue_manager: AsyncMock
     ) -> None:
         """Test that None is returned when user is already processing."""
         mock_queue_manager.dequeue.return_value = None
 
-        result = await processor.process_message("user1", "msg1", "{}")
+        result = await processor.process_message("user1", "msg1", "{}", queue_position=1)
 
         assert result is None
         mock_queue_manager.dequeue.assert_called_once_with("user1")
@@ -77,7 +89,7 @@ class TestMessageProcessor:
         )
         mock_queue_manager.dequeue.return_value = ("msg1", message_data)
 
-        result = await processor.process_message("user1", "msg1", message_data)
+        result = await processor.process_message("user1", "msg1", message_data, queue_position=1)
 
         assert result is not None
         assert result.responses == ["Hello!"]
@@ -97,7 +109,7 @@ class TestMessageProcessor:
         mock_worker_client.send_message.side_effect = WorkerError(500, "Server error")
 
         with pytest.raises(WorkerError):
-            await processor.process_message("user1", "msg1", message_data)
+            await processor.process_message("user1", "msg1", message_data, queue_position=1)
 
         # mark_complete should still be called
         mock_queue_manager.mark_complete.assert_called_once_with("user1", "msg1")
@@ -115,100 +127,64 @@ class TestMessageProcessor:
         mock_worker_client.send_message.side_effect = WorkerTimeoutError(60.0)
 
         with pytest.raises(WorkerTimeoutError):
-            await processor.process_message("user1", "msg1", message_data)
+            await processor.process_message("user1", "msg1", message_data, queue_position=1)
 
         mock_queue_manager.mark_complete.assert_called_once_with("user1", "msg1")
 
     @pytest.mark.asyncio
-    async def test_process_message_processes_next_in_queue(
+    async def test_message_id_mismatch_returns_none(
         self,
         processor: MessageProcessor,
         mock_queue_manager: AsyncMock,
         mock_worker_client: AsyncMock,
     ) -> None:
-        """Test that next message is processed after completing one."""
-        first_msg = json.dumps({"user_id": "user1", "message": "First"})
-        second_msg = json.dumps({"user_id": "user1", "message": "Second"})
-
-        # First dequeue returns msg1, second returns msg2, third returns None
-        mock_queue_manager.dequeue.side_effect = [
-            ("msg1", first_msg),
-            ("msg2", second_msg),
-            None,
-        ]
-        mock_queue_manager.get_queue_length.side_effect = [1, 0]
-
-        await processor.process_message("user1", "msg1", first_msg)
-
-        # Worker should be called twice (for both messages)
-        assert mock_worker_client.send_message.call_count == 2
-        # mark_complete should be called twice
-        assert mock_queue_manager.mark_complete.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_process_next_handles_errors_gracefully(
-        self,
-        processor: MessageProcessor,
-        mock_queue_manager: AsyncMock,
-        mock_worker_client: AsyncMock,
-    ) -> None:
-        """Test that errors in _process_next don't propagate."""
-        first_msg = json.dumps({"user_id": "user1", "message": "First"})
-        second_msg = json.dumps({"user_id": "user1", "message": "Second"})
-
-        mock_queue_manager.dequeue.side_effect = [
-            ("msg1", first_msg),
-            ("msg2", second_msg),
-            None,
-        ]
-        mock_queue_manager.get_queue_length.side_effect = [1, 0]
-
-        # Second message fails
-        mock_worker_client.send_message.side_effect = [
-            WorkerResponse(responses=["First!"], response_language="en"),
-            WorkerError(500, "Server error"),
-        ]
-
-        # Should not raise - the error in _process_next is logged but not raised
-        result = await processor.process_message("user1", "msg1", first_msg)
-
-        assert result is not None
-        assert result.responses == ["First!"]
-        # Both mark_complete calls should happen
-        assert mock_queue_manager.mark_complete.call_count == 2
-
-    @pytest.mark.asyncio
-    async def test_process_next_stops_on_empty_queue(
-        self,
-        processor: MessageProcessor,
-        mock_queue_manager: AsyncMock,
-    ) -> None:
-        """Test that _process_next stops when queue is empty."""
+        """Test that mismatched message IDs return None (don't return wrong response)."""
         msg = json.dumps({"user_id": "user1"})
-        mock_queue_manager.dequeue.return_value = ("msg1", msg)
-        mock_queue_manager.get_queue_length.return_value = 0
-
-        await processor.process_message("user1", "msg1", msg)
-
-        # dequeue should only be called once (for the initial message)
-        assert mock_queue_manager.dequeue.call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_dequeued_message_id_mismatch_logs_warning(
-        self,
-        processor: MessageProcessor,
-        mock_queue_manager: AsyncMock,
-        mock_worker_client: AsyncMock,
-    ) -> None:
-        """Test that mismatched message IDs are logged but processing continues."""
-        msg = json.dumps({"user_id": "user1"})
-        # Return different message ID than expected
+        # Return different message ID than expected - this is a race condition
         mock_queue_manager.dequeue.return_value = ("msg_different", msg)
-        mock_queue_manager.get_queue_length.return_value = 0
 
-        result = await processor.process_message("user1", "msg1", msg)
+        result = await processor.process_message("user1", "msg1", msg, queue_position=1)
 
-        # Processing should still succeed
-        assert result is not None
-        # mark_complete should use the dequeued message ID
+        # Should return None to avoid returning wrong response to client
+        assert result is None
+        # The mismatched message should still be processed and marked complete
+        mock_worker_client.send_message.assert_called_once()
         mock_queue_manager.mark_complete.assert_called_once_with("user1", "msg_different")
+
+    @pytest.mark.asyncio
+    async def test_message_id_mismatch_handles_worker_error(
+        self,
+        processor: MessageProcessor,
+        mock_queue_manager: AsyncMock,
+        mock_worker_client: AsyncMock,
+    ) -> None:
+        """Test that worker errors during mismatch processing are handled gracefully."""
+        msg = json.dumps({"user_id": "user1"})
+        mock_queue_manager.dequeue.return_value = ("msg_different", msg)
+        mock_worker_client.send_message.side_effect = WorkerError(500, "Server error")
+
+        # Should not raise - error is logged but we return None
+        result = await processor.process_message("user1", "msg1", msg, queue_position=1)
+
+        assert result is None
+        # mark_complete should still be called for the mismatched message
+        mock_queue_manager.mark_complete.assert_called_once_with("user1", "msg_different")
+
+    @pytest.mark.asyncio
+    async def test_no_queue_draining_in_request_path(
+        self,
+        processor: MessageProcessor,
+        mock_queue_manager: AsyncMock,
+        mock_worker_client: AsyncMock,
+    ) -> None:
+        """Test that queue is not drained in the request path (no recursive processing)."""
+        message_data = json.dumps({"user_id": "user1"})
+        mock_queue_manager.dequeue.return_value = ("msg1", message_data)
+        # Simulate more messages in queue
+        mock_queue_manager.get_queue_length.return_value = 5
+
+        await processor.process_message("user1", "msg1", message_data, queue_position=1)
+
+        # Should only call dequeue once (not recursively drain queue)
+        assert mock_queue_manager.dequeue.call_count == 1
+        assert mock_queue_manager.mark_complete.call_count == 1
