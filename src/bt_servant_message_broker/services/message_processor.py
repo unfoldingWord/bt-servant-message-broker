@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import socket
+import ssl
 from urllib.parse import urlparse
 
 import httpx
@@ -14,6 +15,8 @@ from bt_servant_message_broker.services.worker_client import WorkerClient, Worke
 
 logger = logging.getLogger(__name__)
 
+_CALLBACK_TIMEOUT = 10.0
+
 
 def _sanitize_url_for_log(url: str) -> str:
     """Return scheme://host for safe logging (strip path/query/fragment)."""
@@ -21,11 +24,16 @@ def _sanitize_url_for_log(url: str) -> str:
     return f"{parsed.scheme}://{parsed.hostname}"
 
 
-async def _validate_callback_host(callback_url: str) -> None:
+async def _validate_callback_host(callback_url: str) -> str | None:
     """Resolve callback hostname and block private/internal IPs (SSRF prevention).
 
-    Complements the model-level literal-IP checks by catching DNS rebinding
-    attacks where a public hostname resolves to a private/link-local address.
+    Resolves the hostname once and returns a validated IP so the caller can
+    connect directly to it, closing the TOCTOU window where DNS could rebind
+    between validation and the HTTP request.
+
+    Returns:
+        A validated public IP string to connect to, or None if DNS failed
+        (let httpx surface the connection error naturally).
 
     Raises:
         ValueError: If any resolved IP is in a blocked range.
@@ -38,8 +46,9 @@ async def _validate_callback_host(callback_url: str) -> None:
     try:
         infos = await loop.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     except socket.gaierror:
-        return  # DNS resolution failed - let httpx surface the connection error
+        return None  # DNS resolution failed - let httpx surface the connection error
 
+    validated_ip: str | None = None
     for info in infos:
         ip_str = info[4][0]
         try:
@@ -54,6 +63,70 @@ async def _validate_callback_host(callback_url: str) -> None:
             or addr.is_unspecified
         ):
             raise ValueError(f"callback_url hostname resolves to blocked IP: {ip_str}")
+        if validated_ip is None:
+            validated_ip = ip_str
+    return validated_ip
+
+
+async def _post_pinned(
+    validated_ip: str,
+    callback_url: str,
+    payload: dict[str, object],
+) -> int:
+    """POST JSON to callback URL, connecting directly to a pre-validated IP.
+
+    Uses asyncio.open_connection with ``server_hostname`` so TLS validates
+    against the original hostname while the TCP connection goes to the
+    already-validated IP address.  This closes the DNS-rebinding TOCTOU
+    window that would exist if we let httpx re-resolve DNS on its own.
+
+    Returns:
+        HTTP status code from the server.
+    """
+    parsed = urlparse(callback_url)
+    hostname = parsed.hostname or ""
+    port = parsed.port or 443
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+
+    ssl_ctx = ssl.create_default_context()
+    body = json.dumps(payload).encode()
+    request_bytes = (
+        f"POST {target} HTTP/1.1\r\n"
+        f"Host: {hostname}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    ).encode() + body
+
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(
+            validated_ip,
+            port,
+            ssl=ssl_ctx,
+            server_hostname=hostname,
+        ),
+        timeout=_CALLBACK_TIMEOUT,
+    )
+
+    try:
+        writer.write(request_bytes)
+        await asyncio.wait_for(writer.drain(), timeout=_CALLBACK_TIMEOUT)
+
+        status_line = await asyncio.wait_for(
+            reader.readline(),
+            timeout=_CALLBACK_TIMEOUT,
+        )
+        parts = status_line.split(b" ", 2)
+        return int(parts[1]) if len(parts) >= 2 else 0
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:  # noqa: BLE001
+            logger.debug("writer.wait_closed() raised during cleanup", exc_info=True)
 
 
 class MessageProcessor:
@@ -180,7 +253,7 @@ class MessageProcessor:
             response: Worker response to deliver.
         """
         try:
-            await _validate_callback_host(callback_url)
+            validated_ip = await _validate_callback_host(callback_url)
         except ValueError as e:
             logger.error(
                 "Callback blocked by SSRF protection",
@@ -188,7 +261,7 @@ class MessageProcessor:
             )
             return
 
-        payload = {
+        payload: dict[str, object] = {
             "message_id": message_id,
             "user_id": user_id,
             "status": "completed",
@@ -198,16 +271,19 @@ class MessageProcessor:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-                result = await client.post(callback_url, json=payload)
+            status_code = await self._post_callback_payload(
+                callback_url,
+                payload,
+                validated_ip,
+            )
 
-            if result.status_code >= 400:
+            if status_code >= 400:
                 logger.error(
                     "Callback delivery got error response",
                     extra={
                         "message_id": message_id,
                         "callback_url": _sanitize_url_for_log(callback_url),
-                        "status_code": result.status_code,
+                        "status_code": status_code,
                     },
                 )
             else:
@@ -216,7 +292,7 @@ class MessageProcessor:
                     extra={
                         "message_id": message_id,
                         "callback_url": _sanitize_url_for_log(callback_url),
-                        "status_code": result.status_code,
+                        "status_code": status_code,
                     },
                 )
         except Exception as e:
@@ -245,7 +321,7 @@ class MessageProcessor:
             error_detail: Description of what went wrong.
         """
         try:
-            await _validate_callback_host(callback_url)
+            validated_ip = await _validate_callback_host(callback_url)
         except ValueError as e:
             logger.error(
                 "Error callback blocked by SSRF protection",
@@ -253,7 +329,7 @@ class MessageProcessor:
             )
             return
 
-        payload = {
+        payload: dict[str, object] = {
             "message_id": message_id,
             "user_id": user_id,
             "status": "error",
@@ -261,16 +337,19 @@ class MessageProcessor:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-                result = await client.post(callback_url, json=payload)
+            status_code = await self._post_callback_payload(
+                callback_url,
+                payload,
+                validated_ip,
+            )
 
-            if result.status_code >= 400:
+            if status_code >= 400:
                 logger.error(
                     "Error callback delivery got error response",
                     extra={
                         "message_id": message_id,
                         "callback_url": _sanitize_url_for_log(callback_url),
-                        "status_code": result.status_code,
+                        "status_code": status_code,
                     },
                 )
             else:
@@ -290,3 +369,30 @@ class MessageProcessor:
                     "error": str(e),
                 },
             )
+
+    async def _post_callback_payload(
+        self,
+        callback_url: str,
+        payload: dict[str, object],
+        validated_ip: str | None,
+    ) -> int:
+        """POST JSON payload to callback URL with IP-pinning when possible.
+
+        When *validated_ip* is available, connects directly via
+        ``asyncio.open_connection`` to the pre-validated IP (with TLS
+        hostname verification preserved via ``server_hostname``).
+
+        Falls back to httpx when DNS resolution failed earlier (validated_ip
+        is None) so that httpx can surface the connection error naturally.
+
+        Returns:
+            HTTP status code from the server.
+        """
+        if validated_ip:
+            return await _post_pinned(validated_ip, callback_url, payload)
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(_CALLBACK_TIMEOUT),
+        ) as client:
+            result = await client.post(callback_url, json=payload)
+        return result.status_code

@@ -8,6 +8,7 @@ import pytest
 
 from bt_servant_message_broker.services.message_processor import (
     MessageProcessor,
+    _post_pinned,
     _validate_callback_host,
 )
 from bt_servant_message_broker.services.worker_client import (
@@ -225,31 +226,23 @@ class TestCallbackDelivery:
             voice_audio_base64=None,
         )
 
-        mock_response = AsyncMock()
-        mock_response.status_code = 200
-
         with (
             patch(
                 "bt_servant_message_broker.services.message_processor._validate_callback_host",
                 new_callable=AsyncMock,
+                return_value="93.184.216.34",
             ),
-            patch(
-                "bt_servant_message_broker.services.message_processor.httpx.AsyncClient"
-            ) as mock_client_cls,
+            patch.object(
+                processor, "_post_callback_payload", new_callable=AsyncMock, return_value=200
+            ) as mock_post,
         ):
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
-
             await processor._deliver_callback(
                 "https://example.com/callback", "msg1", "15551234567", response
             )
 
-            mock_client.post.assert_called_once_with(
+            mock_post.assert_called_once_with(
                 "https://example.com/callback",
-                json={
+                {
                     "message_id": "msg1",
                     "user_id": "15551234567",
                     "status": "completed",
@@ -257,6 +250,7 @@ class TestCallbackDelivery:
                     "response_language": "en",
                     "voice_audio_base64": None,
                 },
+                "93.184.216.34",
             )
 
     @pytest.mark.asyncio
@@ -275,17 +269,15 @@ class TestCallbackDelivery:
             patch(
                 "bt_servant_message_broker.services.message_processor._validate_callback_host",
                 new_callable=AsyncMock,
+                return_value="93.184.216.34",
             ),
-            patch(
-                "bt_servant_message_broker.services.message_processor.httpx.AsyncClient"
-            ) as mock_client_cls,
+            patch.object(
+                processor,
+                "_post_callback_payload",
+                new_callable=AsyncMock,
+                side_effect=Exception("Connection refused"),
+            ),
         ):
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(side_effect=Exception("Connection refused"))
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
-
             # Should not raise
             await processor._deliver_callback(
                 "https://example.com/callback", "msg1", "user1", response
@@ -387,36 +379,29 @@ class TestErrorCallbackDelivery:
         processor: MessageProcessor,
     ) -> None:
         """Test that error callback POST payload has correct structure."""
-        mock_response = AsyncMock()
-        mock_response.status_code = 200
-
         with (
             patch(
                 "bt_servant_message_broker.services.message_processor._validate_callback_host",
                 new_callable=AsyncMock,
+                return_value="93.184.216.34",
             ),
-            patch(
-                "bt_servant_message_broker.services.message_processor.httpx.AsyncClient"
-            ) as mock_client_cls,
+            patch.object(
+                processor, "_post_callback_payload", new_callable=AsyncMock, return_value=200
+            ) as mock_post,
         ):
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(return_value=mock_response)
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
-
             await processor._deliver_error_callback(
                 "https://example.com/callback", "msg1", "user1", "Something went wrong"
             )
 
-            mock_client.post.assert_called_once_with(
+            mock_post.assert_called_once_with(
                 "https://example.com/callback",
-                json={
+                {
                     "message_id": "msg1",
                     "user_id": "user1",
                     "status": "error",
                     "error": "Something went wrong",
                 },
+                "93.184.216.34",
             )
 
     @pytest.mark.asyncio
@@ -429,17 +414,15 @@ class TestErrorCallbackDelivery:
             patch(
                 "bt_servant_message_broker.services.message_processor._validate_callback_host",
                 new_callable=AsyncMock,
+                return_value="93.184.216.34",
             ),
-            patch(
-                "bt_servant_message_broker.services.message_processor.httpx.AsyncClient"
-            ) as mock_client_cls,
+            patch.object(
+                processor,
+                "_post_callback_payload",
+                new_callable=AsyncMock,
+                side_effect=Exception("Connection refused"),
+            ),
         ):
-            mock_client = AsyncMock()
-            mock_client.post = AsyncMock(side_effect=Exception("Connection refused"))
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=None)
-            mock_client_cls.return_value = mock_client
-
             # Should not raise
             await processor._deliver_error_callback(
                 "https://example.com/callback", "msg1", "user1", "Some error"
@@ -468,19 +451,14 @@ class TestSsrfDnsValidation:
                 new_callable=AsyncMock,
                 side_effect=ValueError("callback_url hostname resolves to blocked IP: 10.0.0.1"),
             ),
-            patch(
-                "bt_servant_message_broker.services.message_processor.httpx.AsyncClient"
-            ) as mock_client_cls,
+            patch.object(processor, "_post_callback_payload", new_callable=AsyncMock) as mock_post,
         ):
-            mock_client = AsyncMock()
-            mock_client_cls.return_value = mock_client
-
             # Should not crash, should not POST
             await processor._deliver_callback(
                 "https://evil.com/callback", "msg1", "user1", response
             )
 
-            mock_client.__aenter__.assert_not_called()
+            mock_post.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_validate_callback_host_blocks_private_ip(self) -> None:
@@ -505,20 +483,144 @@ class TestSsrfDnsValidation:
 
     @pytest.mark.asyncio
     async def test_validate_callback_host_allows_public_ip(self) -> None:
-        """Test that _validate_callback_host allows hostnames resolving to public IPs."""
+        """Test that _validate_callback_host returns the validated public IP."""
         mock_loop = AsyncMock()
         mock_loop.getaddrinfo = AsyncMock(return_value=[(2, 1, 6, "", ("93.184.216.34", 0))])
 
         with patch("asyncio.get_running_loop", return_value=mock_loop):
-            # Should not raise
-            await _validate_callback_host("https://example.com/callback")
+            result = await _validate_callback_host("https://example.com/callback")
+            assert result == "93.184.216.34"
 
     @pytest.mark.asyncio
-    async def test_validate_callback_host_dns_failure_passes_through(self) -> None:
-        """Test that DNS resolution failure is not treated as SSRF (let httpx handle it)."""
+    async def test_validate_callback_host_dns_failure_returns_none(self) -> None:
+        """Test that DNS resolution failure returns None (let httpx handle it)."""
         mock_loop = AsyncMock()
         mock_loop.getaddrinfo = AsyncMock(side_effect=socket.gaierror("DNS failed"))
 
         with patch("asyncio.get_running_loop", return_value=mock_loop):
-            # Should not raise - DNS failure is not SSRF
-            await _validate_callback_host("https://nonexistent.example.com/callback")
+            result = await _validate_callback_host("https://nonexistent.example.com/callback")
+            assert result is None
+
+
+class TestPostPinned:
+    """Tests for _post_pinned IP-pinned callback delivery."""
+
+    @pytest.mark.asyncio
+    async def test_connects_to_validated_ip_with_server_hostname(self) -> None:
+        """Test that _post_pinned connects to the validated IP, not the hostname."""
+        mock_writer = MagicMock()
+        mock_writer.write = MagicMock()
+        mock_writer.drain = AsyncMock()
+        mock_writer.close = MagicMock()
+        mock_writer.wait_closed = AsyncMock()
+
+        mock_reader = AsyncMock()
+        mock_reader.readline = AsyncMock(return_value=b"HTTP/1.1 200 OK\r\n")
+
+        with patch(
+            "bt_servant_message_broker.services.message_processor.asyncio.open_connection",
+            new_callable=AsyncMock,
+            return_value=(mock_reader, mock_writer),
+        ) as mock_conn:
+            status = await _post_pinned(
+                "93.184.216.34",
+                "https://example.com/callback",
+                {"message_id": "msg1", "status": "completed"},
+            )
+
+            assert status == 200
+            mock_conn.assert_called_once()
+            call_kwargs = mock_conn.call_args
+            # Verify connection goes to the validated IP, not the hostname
+            assert call_kwargs[0][0] == "93.184.216.34"
+            assert call_kwargs[0][1] == 443
+            # Verify TLS uses the original hostname for cert validation
+            assert call_kwargs[1]["server_hostname"] == "example.com"
+
+    @pytest.mark.asyncio
+    async def test_sends_correct_http_request(self) -> None:
+        """Test that _post_pinned sends a well-formed HTTP/1.1 POST."""
+        mock_writer = MagicMock()
+        written_data = bytearray()
+        mock_writer.write = written_data.extend
+        mock_writer.drain = AsyncMock()
+        mock_writer.close = MagicMock()
+        mock_writer.wait_closed = AsyncMock()
+
+        mock_reader = AsyncMock()
+        mock_reader.readline = AsyncMock(return_value=b"HTTP/1.1 200 OK\r\n")
+
+        with patch(
+            "bt_servant_message_broker.services.message_processor.asyncio.open_connection",
+            new_callable=AsyncMock,
+            return_value=(mock_reader, mock_writer),
+        ):
+            await _post_pinned(
+                "93.184.216.34",
+                "https://example.com/callback",
+                {"key": "value"},
+            )
+
+        request_str = written_data.decode()
+        assert request_str.startswith("POST /callback HTTP/1.1\r\n")
+        assert "Host: example.com\r\n" in request_str
+        assert "Content-Type: application/json\r\n" in request_str
+        assert '"key": "value"' in request_str
+
+
+class TestPostCallbackPayload:
+    """Tests for _post_callback_payload routing."""
+
+    @pytest.mark.asyncio
+    async def test_uses_pinned_post_when_ip_available(
+        self,
+        processor: MessageProcessor,
+    ) -> None:
+        """Test that _post_callback_payload uses _post_pinned when validated_ip is set."""
+        with patch(
+            "bt_servant_message_broker.services.message_processor._post_pinned",
+            new_callable=AsyncMock,
+            return_value=200,
+        ) as mock_pinned:
+            status = await processor._post_callback_payload(
+                "https://example.com/callback",
+                {"msg": "data"},
+                "93.184.216.34",
+            )
+
+            assert status == 200
+            mock_pinned.assert_called_once_with(
+                "93.184.216.34",
+                "https://example.com/callback",
+                {"msg": "data"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_httpx_when_no_ip(
+        self,
+        processor: MessageProcessor,
+    ) -> None:
+        """Test that _post_callback_payload falls back to httpx when validated_ip is None."""
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+
+        with patch(
+            "bt_servant_message_broker.services.message_processor.httpx.AsyncClient"
+        ) as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            status = await processor._post_callback_payload(
+                "https://example.com/callback",
+                {"msg": "data"},
+                None,
+            )
+
+            assert status == 200
+            mock_client.post.assert_called_once_with(
+                "https://example.com/callback",
+                json={"msg": "data"},
+            )
