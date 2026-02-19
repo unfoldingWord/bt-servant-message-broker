@@ -336,7 +336,10 @@ class TestStreamHandoff:
 
         processor = MessageProcessor(mock_queue, mock_worker, stream_proxy=proxy)
 
-        message_data = json.dumps({"user_id": "user1", "message": "hello"})
+        # callback_url present → normal callback processing
+        message_data = json.dumps(
+            {"user_id": "user1", "message": "hello", "callback_url": "https://example.com/cb"}
+        )
         mock_queue.dequeue = AsyncMock(return_value=("msg-1", message_data))
 
         with patch.object(processor, "_schedule_next_processing"):
@@ -346,6 +349,74 @@ class TestStreamHandoff:
         mock_worker.send_message.assert_called_once()
         # mark_complete SHOULD have been called
         mock_queue.mark_complete.assert_called_once_with("user1", "msg-1")
+
+    @pytest.mark.asyncio
+    async def test_sse_message_waits_for_registration(self) -> None:
+        """Test that processor waits for SSE stream registration when not yet registered.
+
+        Regression test for the drain-chain race: SSE message queued at position > 1
+        becomes head of queue when prior message completes, but client hasn't
+        registered yet.
+        """
+        mock_queue = AsyncMock()
+        mock_worker = AsyncMock()
+        proxy = StreamProxy(
+            worker_base_url="https://worker.example.com",
+            api_key="key",
+        )
+
+        processor = MessageProcessor(mock_queue, mock_worker, stream_proxy=proxy)
+
+        # No callback_url → SSE mode
+        message_data = json.dumps({"user_id": "user1", "message": "hello"})
+        mock_queue.dequeue = AsyncMock(return_value=("msg-1", message_data))
+
+        # Simulate client registering after a short delay
+        async def register_after_delay() -> None:
+            await asyncio.sleep(0.05)
+            proxy.register("msg-1")
+
+        asyncio.create_task(register_after_delay())
+
+        with patch.object(processor, "_schedule_next_processing"):
+            await processor._process_next_message("user1")
+
+        # Worker should NOT have been called (handed off to SSE)
+        mock_worker.send_message.assert_not_called()
+        # mark_complete should NOT have been called (SSE handler does it)
+        mock_queue.mark_complete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sse_message_discarded_on_registration_timeout(self) -> None:
+        """Test that SSE message is cleaned up when no client connects in time."""
+        mock_queue = AsyncMock()
+        mock_worker = AsyncMock()
+        proxy = StreamProxy(
+            worker_base_url="https://worker.example.com",
+            api_key="key",
+        )
+
+        processor = MessageProcessor(mock_queue, mock_worker, stream_proxy=proxy)
+
+        # No callback_url → SSE mode, but no client will connect
+        message_data = json.dumps({"user_id": "user1", "message": "hello"})
+        mock_queue.dequeue = AsyncMock(return_value=("msg-1", message_data))
+
+        with (
+            patch.object(processor, "_schedule_next_processing") as mock_schedule,
+            patch(
+                "bt_servant_message_broker.services.message_processor._STREAM_REGISTRATION_TIMEOUT",
+                0.05,
+            ),
+        ):
+            await processor._process_next_message("user1")
+
+        # Worker should NOT have been called
+        mock_worker.send_message.assert_not_called()
+        # mark_complete SHOULD have been called (cleanup)
+        mock_queue.mark_complete.assert_called_once_with("user1", "msg-1")
+        # Next processing should be scheduled
+        mock_schedule.assert_called_once_with("user1")
 
     @pytest.mark.asyncio
     async def test_normal_processing_when_no_stream_proxy(self) -> None:
@@ -370,6 +441,124 @@ class TestStreamHandoff:
 
         mock_worker.send_message.assert_called_once()
         mock_queue.mark_complete.assert_called_once_with("user1", "msg-1")
+
+
+class TestWaitForRegistration:
+    """Tests for the wait_for_registration coordination mechanism."""
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_already_registered(self, stream_proxy: StreamProxy) -> None:
+        """Test immediate return when message is already registered."""
+        stream_proxy.register("msg-1")
+        result = await stream_proxy.wait_for_registration("msg-1", timeout=1.0)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_returns_true_when_registered_during_wait(
+        self, stream_proxy: StreamProxy
+    ) -> None:
+        """Test that wait resolves when register() is called during the wait."""
+
+        async def register_after_delay() -> None:
+            await asyncio.sleep(0.05)
+            stream_proxy.register("msg-1")
+
+        asyncio.create_task(register_after_delay())
+        result = await stream_proxy.wait_for_registration("msg-1", timeout=5.0)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_returns_false_on_timeout(self, stream_proxy: StreamProxy) -> None:
+        """Test that wait returns False when registration doesn't happen."""
+        result = await stream_proxy.wait_for_registration("msg-1", timeout=0.05)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_cleans_up_event_after_timeout(self, stream_proxy: StreamProxy) -> None:
+        """Test that the internal event is cleaned up after timeout."""
+        await stream_proxy.wait_for_registration("msg-1", timeout=0.05)
+        assert "msg-1" not in stream_proxy._registration_events
+
+    @pytest.mark.asyncio
+    async def test_cleans_up_event_after_success(self, stream_proxy: StreamProxy) -> None:
+        """Test that the internal event is cleaned up after successful registration."""
+
+        async def register_soon() -> None:
+            await asyncio.sleep(0.01)
+            stream_proxy.register("msg-1")
+
+        asyncio.create_task(register_soon())
+        await stream_proxy.wait_for_registration("msg-1", timeout=5.0)
+        assert "msg-1" not in stream_proxy._registration_events
+
+
+class TestProxyStreamTriggersProcessing:
+    """Tests that proxy_stream triggers processing after registration."""
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_triggers_processing_when_queue_has_work(self) -> None:
+        """Test that proxy_stream calls trigger_processing when user has queued messages."""
+        mock_queue = AsyncMock()
+        mock_queue.get_queue_length = AsyncMock(return_value=1)
+        mock_processor = MagicMock(spec=MessageProcessor)
+        proxy = StreamProxy(
+            worker_base_url="https://worker.example.com",
+            api_key="key",
+        )
+        proxy.configure(mock_queue, mock_processor)
+
+        async for event in proxy.proxy_stream("user1", "msg-1"):
+            assert event["event"] == "queued"
+            mock_processor.trigger_processing.assert_called_once_with("user1")
+            break
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_skips_trigger_when_no_queued_work(self) -> None:
+        """Test that proxy_stream does NOT trigger when user has no queued messages."""
+        mock_queue = AsyncMock()
+        mock_queue.get_queue_length = AsyncMock(return_value=0)
+        mock_queue.is_processing = AsyncMock(return_value=False)
+        mock_processor = MagicMock(spec=MessageProcessor)
+        proxy = StreamProxy(
+            worker_base_url="https://worker.example.com",
+            api_key="key",
+        )
+        proxy.configure(mock_queue, mock_processor)
+
+        async for event in proxy.proxy_stream("user1", "msg-1"):
+            assert event["event"] == "queued"
+            mock_processor.trigger_processing.assert_not_called()
+            break
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_triggers_when_is_processing(self) -> None:
+        """Test that proxy_stream triggers when queue is empty but user is processing."""
+        mock_queue = AsyncMock()
+        mock_queue.get_queue_length = AsyncMock(return_value=0)
+        mock_queue.is_processing = AsyncMock(return_value=True)
+        mock_processor = MagicMock(spec=MessageProcessor)
+        proxy = StreamProxy(
+            worker_base_url="https://worker.example.com",
+            api_key="key",
+        )
+        proxy.configure(mock_queue, mock_processor)
+
+        async for event in proxy.proxy_stream("user1", "msg-1"):
+            assert event["event"] == "queued"
+            mock_processor.trigger_processing.assert_called_once_with("user1")
+            break
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_works_without_processor(self) -> None:
+        """Test that proxy_stream works when processor is not configured."""
+        proxy = StreamProxy(
+            worker_base_url="https://worker.example.com",
+            api_key="key",
+        )
+
+        async for event in proxy.proxy_stream("user1", "msg-1"):
+            assert event["event"] == "queued"
+            break
 
 
 class TestStreamProxyClose:

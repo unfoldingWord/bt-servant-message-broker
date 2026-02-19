@@ -17,6 +17,7 @@ from bt_servant_message_broker.services.worker_client import WorkerClient, Worke
 logger = logging.getLogger(__name__)
 
 _CALLBACK_TIMEOUT = 10.0
+_STREAM_REGISTRATION_TIMEOUT = 30.0  # seconds to wait for SSE client to connect
 
 
 def _sanitize_url_for_log(url: str) -> str:
@@ -203,6 +204,26 @@ class MessageProcessor:
                 parsed = json.loads(message_data)
                 self._stream_proxy.handoff(message_id, parsed)
                 return  # SSE handler takes over mark_complete + trigger_next
+
+            # For SSE messages (no callback_url), wait for the client to open
+            # the stream before processing. This handles the drain-chain race
+            # where a prior message completes and the processor dequeues this
+            # SSE message before the client connects to GET /api/v1/stream.
+            pre_parsed = json.loads(message_data)
+            if not pre_parsed.get("callback_url") and self._stream_proxy:
+                registered = await self._stream_proxy.wait_for_registration(
+                    message_id, timeout=_STREAM_REGISTRATION_TIMEOUT
+                )
+                if registered:
+                    self._stream_proxy.handoff(message_id, pre_parsed)
+                    return  # SSE handler takes over mark_complete + trigger_next
+                logger.warning(
+                    "SSE message has no stream registration — discarding",
+                    extra={"user_id": user_id, "message_id": message_id},
+                )
+                await self._queue.mark_complete(user_id, message_id)
+                self._schedule_next_processing(user_id)
+                return
 
             callback_url: str | None = None
             msg_user_id = user_id
