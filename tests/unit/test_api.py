@@ -2,11 +2,10 @@
 
 import json
 import os
-from collections.abc import AsyncIterator
-from unittest.mock import AsyncMock, MagicMock, patch
+from collections.abc import AsyncGenerator
+from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
-from sse_starlette.event import ServerSentEvent
 
 from bt_servant_message_broker.api.dependencies import (
     get_message_processor,
@@ -17,7 +16,6 @@ from bt_servant_message_broker.api.dependencies import (
 from bt_servant_message_broker.main import app
 from bt_servant_message_broker.services.message_processor import MessageProcessor
 from bt_servant_message_broker.services.queue_manager import QueueManager
-from bt_servant_message_broker.services.stream_proxy import StreamProxy
 from bt_servant_message_broker.services.worker_client import WorkerClient
 
 
@@ -304,86 +302,52 @@ class TestQueueStatusEndpoint:
 
 
 class TestStreamEndpoint:
-    """Tests for the POST /api/v1/stream endpoint."""
+    """Tests for the GET /api/v1/stream endpoint."""
 
-    _VALID_STREAM_BODY = {
-        "user_id": "user123",
-        "org_id": "org456",
-        "message": "Hello",
-        "client_id": "web",
-    }
+    def test_stream_endpoint_returns_sse(self) -> None:
+        """GET /api/v1/stream returns EventSourceResponse with SSE content type."""
 
-    def test_stream_returns_503_without_queue(self) -> None:
-        """503 when queue_manager is unavailable."""
-        app.dependency_overrides[get_stream_proxy] = lambda: MagicMock(spec=StreamProxy)
+        class FakeStreamProxy:
+            async def proxy_stream(
+                self, user_id: str, message_id: str
+            ) -> AsyncGenerator[dict[str, str], None]:
+                yield {
+                    "event": "queued",
+                    "data": json.dumps({"message_id": message_id}),
+                }
+                yield {
+                    "event": "done",
+                    "data": json.dumps({"message_id": message_id}),
+                }
+
+        app.dependency_overrides[get_stream_proxy] = FakeStreamProxy
         try:
             client = TestClient(app)
-            response = client.post("/api/v1/stream", json=self._VALID_STREAM_BODY)
-            assert response.status_code == 503
-            assert response.json()["detail"] == "Queue service unavailable"
+            response = client.get("/api/v1/stream?user_id=user1&message_id=msg1")
+            assert response.headers["content-type"].startswith("text/event-stream")
+            body = response.text
+            assert "event: queued" in body
+            assert "event: done" in body
         finally:
             app.dependency_overrides.clear()
 
-    def test_stream_returns_503_without_proxy(self) -> None:
-        """503 when stream_proxy is unavailable."""
-        mock_qm = create_mock_queue_manager()
-        app.dependency_overrides[get_queue_manager] = lambda: mock_qm
-        app.dependency_overrides[get_stream_proxy] = lambda: None
-        try:
-            client = TestClient(app)
-            response = client.post("/api/v1/stream", json=self._VALID_STREAM_BODY)
-            assert response.status_code == 503
-            assert response.json()["detail"] == "Stream service unavailable"
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_stream_returns_422_with_missing_fields(self) -> None:
-        """422 when required fields are missing from body."""
-        mock_qm = create_mock_queue_manager()
-        mock_proxy = MagicMock(spec=StreamProxy)
-        app.dependency_overrides[get_queue_manager] = lambda: mock_qm
-        app.dependency_overrides[get_stream_proxy] = lambda: mock_proxy
-        try:
-            client = TestClient(app)
-            response = client.post("/api/v1/stream", json={"user_id": "user123"})
-            assert response.status_code == 422
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_stream_requires_auth(self) -> None:
+    def test_stream_endpoint_requires_auth(self) -> None:
         """401 without API key when auth is configured."""
         os.environ["BROKER_API_KEY"] = "secret-key"
         try:
             client = TestClient(app)
-            response = client.post("/api/v1/stream", json=self._VALID_STREAM_BODY)
+            response = client.get("/api/v1/stream?user_id=user1&message_id=msg1")
             assert response.status_code == 401
         finally:
             os.environ.pop("BROKER_API_KEY", None)
 
-    def test_stream_returns_event_source_response(self) -> None:
-        """POST /api/v1/stream returns SSE content type when dependencies are met."""
-        mock_qm = create_mock_queue_manager()
-        mock_proxy = MagicMock(spec=StreamProxy)
-        mock_processor = MagicMock(spec=MessageProcessor)
-        app.dependency_overrides[get_queue_manager] = lambda: mock_qm
-        app.dependency_overrides[get_stream_proxy] = lambda: mock_proxy
-        app.dependency_overrides[get_message_processor] = lambda: mock_processor
-
-        async def fake_generator(
-            request: object,
-            queue_manager: object,
-            stream_proxy: object,
-            message_processor: object,
-        ) -> AsyncIterator[ServerSentEvent]:
-            yield ServerSentEvent(data=json.dumps({"message_id": "test-123"}), event="queued")
-            yield ServerSentEvent(data="", event="done")
-
+    def test_stream_endpoint_503_without_proxy(self) -> None:
+        """503 when stream_proxy is unavailable."""
+        app.dependency_overrides[get_stream_proxy] = lambda: None
         try:
-            with patch("bt_servant_message_broker.api.routes._stream_generator", fake_generator):
-                client = TestClient(app)
-                response = client.post("/api/v1/stream", json=self._VALID_STREAM_BODY)
-                assert response.headers["content-type"].startswith("text/event-stream")
-                assert "event: queued" in response.text
-                assert "event: done" in response.text
+            client = TestClient(app)
+            response = client.get("/api/v1/stream?user_id=user1&message_id=msg1")
+            assert response.status_code == 503
+            assert response.json()["detail"] == "Streaming service unavailable"
         finally:
             app.dependency_overrides.clear()
