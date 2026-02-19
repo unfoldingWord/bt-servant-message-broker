@@ -159,7 +159,7 @@ class TestDequeue:
         mock_dequeue_script.assert_called_once()
         call_kwargs = mock_dequeue_script.call_args[1]
         assert call_kwargs["keys"] == ["user:user1:queue", "user:user1:processing"]
-        assert call_kwargs["args"] == [QueueManager.PROCESSING_TTL]
+        assert call_kwargs["args"] == [QueueManager.DEFAULT_PROCESSING_TTL]
 
 
 class TestMarkComplete:

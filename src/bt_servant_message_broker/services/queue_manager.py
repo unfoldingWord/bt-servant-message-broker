@@ -1,9 +1,12 @@
 """Redis queue operations for per-user message ordering."""
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # Lua script for atomic dequeue operation
@@ -67,15 +70,19 @@ class QueueManager:
         message:{msg_id} - HASH for message metadata
     """
 
-    PROCESSING_TTL = 300  # 5 minutes - prevents stale locks if worker crashes
+    DEFAULT_PROCESSING_TTL = 300  # 5 minutes default
 
-    def __init__(self, redis_client: Any) -> None:
+    def __init__(self, redis_client: Any, processing_ttl: int | None = None) -> None:
         """Initialize the queue manager.
 
         Args:
             redis_client: Async Redis client instance.
+            processing_ttl: TTL in seconds for the processing lock. Should be longer
+                than the worker timeout to prevent lock expiry during processing.
+                Defaults to 300 seconds (5 minutes).
         """
         self._redis: Any = redis_client
+        self._processing_ttl = processing_ttl or self.DEFAULT_PROCESSING_TTL
         self._dequeue_script: Any = None
         self._mark_complete_script: Any = None
 
@@ -150,6 +157,16 @@ class QueueManager:
         # Store message metadata for debugging/monitoring
         await self._redis.hset(message_key, mapping=metadata)
 
+        logger.info(
+            "Enqueued message",
+            extra={
+                "user_id": user_id,
+                "message_id": message_id,
+                "queue_position": position,
+                "client_id": metadata.get("client_id"),
+            },
+        )
+
         return position
 
     async def dequeue(self, user_id: str) -> tuple[str, str] | None:
@@ -173,10 +190,14 @@ class QueueManager:
         script = await self._get_dequeue_script()
         entry: str | None = await script(
             keys=[queue_key, processing_key],
-            args=[self.PROCESSING_TTL],
+            args=[self._processing_ttl],
         )
 
         if entry is None:
+            logger.debug(
+                "Dequeue returned None (user busy or queue empty)",
+                extra={"user_id": user_id},
+            )
             return None
 
         # Parse the queue entry
@@ -188,6 +209,18 @@ class QueueManager:
         message_key = self._message_key(message_id)
         started_at = datetime.now(timezone.utc).isoformat()
         await self._redis.hset(message_key, "started_at", started_at)
+
+        # Get remaining queue length for logging
+        remaining = await self.get_queue_length(user_id)
+
+        logger.info(
+            "Dequeued message for processing",
+            extra={
+                "user_id": user_id,
+                "message_id": message_id,
+                "remaining_in_queue": remaining,
+            },
+        )
 
         return (message_id, message_data)
 
@@ -215,7 +248,19 @@ class QueueManager:
             args=[message_id],
         )
 
-        return result == 1
+        success = result == 1
+        if success:
+            logger.info(
+                "Marked message complete",
+                extra={"user_id": user_id, "message_id": message_id},
+            )
+        else:
+            logger.warning(
+                "Failed to mark message complete (stale or already cleared)",
+                extra={"user_id": user_id, "message_id": message_id},
+            )
+
+        return success
 
     async def get_queue_length(self, user_id: str) -> int:
         """Get the number of messages in a user's queue.

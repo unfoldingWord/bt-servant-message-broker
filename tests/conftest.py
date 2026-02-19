@@ -9,7 +9,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from bt_servant_message_broker.main import app
+from bt_servant_message_broker.services.message_processor import MessageProcessor
 from bt_servant_message_broker.services.queue_manager import QueueManager
+from bt_servant_message_broker.services.worker_client import WorkerClient, WorkerResponse
 
 
 @pytest.fixture(autouse=True)
@@ -126,3 +128,30 @@ def mock_mark_complete_script(mock_redis: AsyncMock) -> AsyncMock:
 def make_queue_entry(message_id: str, data: str) -> str:
     """Helper to create a queue entry JSON string."""
     return json.dumps({"id": message_id, "data": data})
+
+
+@pytest.fixture
+def mock_worker_client() -> AsyncMock:
+    """Create a mock WorkerClient for testing.
+
+    Returns a mock that simulates successful worker responses.
+    """
+    mock = AsyncMock(spec=WorkerClient)
+    mock.send_message = AsyncMock(
+        return_value=WorkerResponse(
+            responses=["Hello!"],
+            response_language="en",
+            voice_audio_base64=None,
+        )
+    )
+    mock.health_check = AsyncMock(return_value=True)
+    mock.close = AsyncMock()
+    return mock
+
+
+@pytest.fixture
+def mock_message_processor(
+    queue_manager: QueueManager, mock_worker_client: AsyncMock
+) -> MessageProcessor:
+    """Create a MessageProcessor with mocked worker client."""
+    return MessageProcessor(queue_manager, mock_worker_client)

@@ -80,6 +80,58 @@ class TestMessageRequest:
                 message_type="invalid",  # type: ignore[arg-type]
             )
 
+    def test_audio_requires_audio_base64(self) -> None:
+        """Test that audio message_type requires audio_base64."""
+        with pytest.raises(ValidationError) as exc_info:
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="",
+                message_type=MessageType.AUDIO,
+                audio_format="ogg",
+                client_id=ClientId.WEB,
+            )
+        assert "audio_base64 is required" in str(exc_info.value)
+
+    def test_audio_requires_audio_format(self) -> None:
+        """Test that audio message_type requires audio_format."""
+        with pytest.raises(ValidationError) as exc_info:
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="",
+                message_type=MessageType.AUDIO,
+                audio_base64="base64data",
+                client_id=ClientId.WEB,
+            )
+        assert "audio_format is required" in str(exc_info.value)
+
+    def test_text_requires_message(self) -> None:
+        """Test that text message_type requires non-empty message."""
+        with pytest.raises(ValidationError) as exc_info:
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="",
+                message_type=MessageType.TEXT,
+                client_id=ClientId.WEB,
+            )
+        assert "message is required" in str(exc_info.value)
+
+    def test_audio_allows_empty_message(self) -> None:
+        """Test that audio message_type allows empty message."""
+        request = MessageRequest(
+            user_id="user123",
+            org_id="org456",
+            message="",
+            message_type=MessageType.AUDIO,
+            audio_base64="base64data",
+            audio_format="ogg",
+            client_id=ClientId.WEB,
+        )
+        assert request.message == ""
+        assert request.audio_base64 == "base64data"
+
 
 class TestQueuedResponse:
     """Tests for QueuedResponse model."""
