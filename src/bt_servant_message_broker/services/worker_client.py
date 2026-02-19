@@ -2,6 +2,7 @@
 
 import logging
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -68,6 +69,25 @@ class WorkerClient:
             )
         return self._client
 
+    @staticmethod
+    def _build_payload(message_data: dict[str, Any]) -> dict[str, Any]:
+        """Build the worker API payload from message data.
+
+        Maps org_id -> org and includes optional audio fields.
+        """
+        payload: dict[str, Any] = {
+            "client_id": message_data.get("client_id"),
+            "user_id": message_data.get("user_id"),
+            "message": message_data.get("message"),
+            "message_type": message_data.get("message_type", "text"),
+            "org": message_data.get("org_id"),
+        }
+        if message_data.get("audio_base64"):
+            payload["audio_base64"] = message_data["audio_base64"]
+        if message_data.get("audio_format"):
+            payload["audio_format"] = message_data["audio_format"]
+        return payload
+
     async def send_message(self, message_data: dict[str, Any]) -> WorkerResponse:
         """Send a message to the worker for processing.
 
@@ -83,21 +103,7 @@ class WorkerClient:
             WorkerError: For other HTTP errors.
         """
         client = await self._get_client()
-
-        # Map org_id -> org for worker API
-        payload = {
-            "client_id": message_data.get("client_id"),
-            "user_id": message_data.get("user_id"),
-            "message": message_data.get("message"),
-            "message_type": message_data.get("message_type", "text"),
-            "org": message_data.get("org_id"),
-        }
-
-        # Include optional fields if present
-        if message_data.get("audio_base64"):
-            payload["audio_base64"] = message_data["audio_base64"]
-        if message_data.get("audio_format"):
-            payload["audio_format"] = message_data["audio_format"]
+        payload = self._build_payload(message_data)
 
         user_id = payload.get("user_id")
         org = payload.get("org")
@@ -184,6 +190,55 @@ class WorkerClient:
                 },
             )
             raise WorkerError(502, f"Invalid worker response: {e}") from e
+
+    async def stream_message(self, message_data: dict[str, Any]) -> AsyncIterator[str]:
+        """Stream a message response from the worker via SSE.
+
+        Opens a streaming POST to the worker and yields raw response lines.
+
+        Args:
+            message_data: Message payload to send (same format as send_message).
+
+        Yields:
+            Individual SSE lines from the worker response.
+
+        Raises:
+            WorkerTimeoutError: If the request times out.
+            WorkerError: For HTTP errors or connection failures.
+        """
+        client = await self._get_client()
+        payload = self._build_payload(message_data)
+        user_id = payload.get("user_id")
+
+        logger.info(
+            "Opening streaming connection to worker",
+            extra={"user_id": user_id, "worker_url": self._base_url},
+        )
+
+        try:
+            async with client.stream(
+                "POST",
+                f"{self._base_url}/api/v1/chat",
+                json=payload,
+                headers={"Accept": "text/event-stream"},
+            ) as response:
+                if response.status_code >= 400:
+                    body = await response.aread()
+                    text = body.decode("utf-8", errors="replace")
+                    if response.status_code >= 500:
+                        raise WorkerError(502, f"Worker error: {text}")
+                    raise WorkerError(response.status_code, text)
+                async for line in response.aiter_lines():
+                    yield line
+        except httpx.TimeoutException as e:
+            raise WorkerTimeoutError(self._timeout) from e
+        except httpx.ConnectError as e:
+            raise WorkerError(503, f"Worker unreachable: {e}") from e
+
+        logger.info(
+            "Worker stream completed",
+            extra={"user_id": user_id},
+        )
 
     async def health_check(self) -> bool:
         """Check if the worker is healthy.

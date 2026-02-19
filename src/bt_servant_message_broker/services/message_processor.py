@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import httpx
 
 from bt_servant_message_broker.services.queue_manager import QueueManager
+from bt_servant_message_broker.services.stream_proxy import StreamProxy
 from bt_servant_message_broker.services.worker_client import WorkerClient, WorkerResponse
 
 logger = logging.getLogger(__name__)
@@ -139,15 +140,22 @@ class MessageProcessor:
     - After completion, schedules next message processing
     """
 
-    def __init__(self, queue_manager: QueueManager, worker_client: WorkerClient) -> None:
+    def __init__(
+        self,
+        queue_manager: QueueManager,
+        worker_client: WorkerClient,
+        stream_proxy: StreamProxy | None = None,
+    ) -> None:
         """Initialize the message processor.
 
         Args:
             queue_manager: QueueManager for queue operations.
             worker_client: WorkerClient for worker communication.
+            stream_proxy: Optional StreamProxy for SSE stream handoff.
         """
         self._queue = queue_manager
         self._worker = worker_client
+        self._stream_proxy = stream_proxy
 
     def trigger_processing(self, user_id: str) -> None:
         """Kick off background processing for a user's queue.
@@ -189,6 +197,12 @@ class MessageProcessor:
                 "Processing message in background",
                 extra={"user_id": user_id, "message_id": message_id},
             )
+
+            # Hand off to SSE stream handler if one is waiting for this message
+            if self._stream_proxy and self._stream_proxy.is_registered(message_id):
+                parsed = json.loads(message_data)
+                self._stream_proxy.handoff(message_id, parsed)
+                return  # SSE handler takes over mark_complete + trigger_next
 
             callback_url: str | None = None
             msg_user_id = user_id

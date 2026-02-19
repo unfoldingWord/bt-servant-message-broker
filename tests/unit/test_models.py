@@ -10,6 +10,7 @@ from bt_servant_message_broker.models import (
     MessageType,
     QueuedResponse,
     QueueStatusResponse,
+    StreamRequest,
 )
 
 VALID_CALLBACK_URL = "https://example.com/callback"
@@ -62,15 +63,15 @@ class TestMessageRequest:
         with pytest.raises(ValidationError):
             MessageRequest(user_id="user123")  # type: ignore[call-arg]
 
-    def test_missing_callback_url(self) -> None:
-        """Test that missing callback_url raises ValidationError."""
-        with pytest.raises(ValidationError):
-            MessageRequest(
-                user_id="user123",
-                org_id="org456",
-                message="Hello",
-                client_id=ClientId.WEB,
-            )  # type: ignore[call-arg]
+    def test_callback_url_optional(self) -> None:
+        """Test that callback_url defaults to None (SSE streaming mode)."""
+        request = MessageRequest(
+            user_id="user123",
+            org_id="org456",
+            message="Hello",
+            client_id=ClientId.WEB,
+        )
+        assert request.callback_url is None
 
     def test_invalid_client_id(self) -> None:
         """Test that invalid client_id raises ValidationError."""
@@ -375,3 +376,56 @@ class TestMessageType:
         """Test all message type values are accessible."""
         assert MessageType.TEXT.value == "text"
         assert MessageType.AUDIO.value == "audio"
+
+
+class TestStreamRequest:
+    """Tests for StreamRequest model (SSE streaming, no callback_url)."""
+
+    def test_minimal_request(self) -> None:
+        """Test creating a StreamRequest with required fields."""
+        request = StreamRequest(
+            user_id="user123",
+            org_id="org456",
+            message="Hello",
+            client_id=ClientId.WEB,
+        )
+        assert request.user_id == "user123"
+        assert request.org_id == "org456"
+        assert request.message == "Hello"
+        assert request.client_id == ClientId.WEB
+        assert request.message_type == MessageType.TEXT
+
+    def test_no_callback_url_field(self) -> None:
+        """Test that StreamRequest does not have a callback_url field."""
+        assert "callback_url" not in StreamRequest.model_fields
+
+    def test_missing_required_fields(self) -> None:
+        """Test that missing required fields raise ValidationError."""
+        with pytest.raises(ValidationError):
+            StreamRequest(user_id="user123")  # type: ignore[call-arg]
+
+    def test_text_requires_message(self) -> None:
+        """Test that text message_type requires non-empty message."""
+        with pytest.raises(ValidationError) as exc_info:
+            StreamRequest(
+                user_id="user123",
+                org_id="org456",
+                message="",
+                message_type=MessageType.TEXT,
+                client_id=ClientId.WEB,
+            )
+        assert "message is required" in str(exc_info.value)
+
+    def test_audio_request(self) -> None:
+        """Test creating an audio StreamRequest."""
+        request = StreamRequest(
+            user_id="user123",
+            org_id="org456",
+            message="",
+            message_type=MessageType.AUDIO,
+            audio_base64="base64data",
+            audio_format="ogg",
+            client_id=ClientId.WEB,
+        )
+        assert request.audio_base64 == "base64data"
+        assert request.audio_format == "ogg"

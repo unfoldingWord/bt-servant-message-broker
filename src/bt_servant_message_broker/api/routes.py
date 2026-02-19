@@ -1,14 +1,20 @@
 """API route definitions for the message broker."""
 
+import asyncio
+import json
 import logging
+from collections.abc import AsyncIterator
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
+from sse_starlette.event import ServerSentEvent
+from sse_starlette.sse import EventSourceResponse
 
 from bt_servant_message_broker.api.dependencies import (
     RequireApiKey,
     RequireMessageProcessor,
     RequireQueueManager,
+    RequireStreamProxy,
     RequireWorkerClient,
 )
 from bt_servant_message_broker.models import (
@@ -16,8 +22,10 @@ from bt_servant_message_broker.models import (
     MessageRequest,
     MessageResponse,
     QueueStatusResponse,
+    StreamRequest,
 )
 from bt_servant_message_broker.services.queue_manager import QueueManager
+from bt_servant_message_broker.services.stream_proxy import StreamProxy
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +81,107 @@ async def submit_message(
         message_id=message_id,
         queue_position=position,
     )
+
+
+_STREAM_HANDOFF_TIMEOUT = 120.0  # seconds to wait for queue handoff
+
+
+@router.post("/api/v1/stream")
+async def stream_message(
+    request: StreamRequest,
+    _api_key: RequireApiKey,
+    queue_manager: RequireQueueManager,
+    stream_proxy: RequireStreamProxy,
+    message_processor: RequireMessageProcessor,
+) -> EventSourceResponse:
+    """Submit a message and stream the AI response via SSE.
+
+    Enqueues the message, waits for its turn in the per-user FIFO queue,
+    then proxies the SSE stream from the worker back to the client.
+    """
+    if queue_manager is None:
+        logger.error("Queue service unavailable for stream request")
+        raise HTTPException(status_code=503, detail="Queue service unavailable")
+
+    if stream_proxy is None:
+        logger.error("Stream proxy unavailable")
+        raise HTTPException(status_code=503, detail="Stream service unavailable")
+
+    return EventSourceResponse(
+        _stream_generator(request, queue_manager, stream_proxy, message_processor),
+    )
+
+
+async def _stream_generator(
+    request: StreamRequest,
+    queue_manager: QueueManager,
+    stream_proxy: StreamProxy,
+    message_processor: object | None,
+) -> AsyncIterator[ServerSentEvent]:
+    """Async generator that drives the SSE stream lifecycle."""
+    message_id = QueueManager.generate_message_id()
+    message_data = request.model_dump_json()
+    user_id = request.user_id
+    handoff_future: asyncio.Future[dict[str, object]] | None = None
+
+    try:
+        # 1. Enqueue message
+        position = await queue_manager.enqueue(user_id, message_id, message_data)
+        logger.info(
+            "Stream message queued",
+            extra={
+                "user_id": user_id,
+                "message_id": message_id,
+                "queue_position": position,
+            },
+        )
+        yield ServerSentEvent(
+            data=json.dumps({"message_id": message_id, "queue_position": position}),
+            event="queued",
+        )
+
+        # 2. Register for handoff and trigger processing
+        handoff_future = stream_proxy.register(message_id)
+        if message_processor and hasattr(message_processor, "trigger_processing"):
+            message_processor.trigger_processing(user_id)  # type: ignore[union-attr]
+
+        # 3. Wait for the background processor to hand off this message
+        try:
+            handoff_data: dict[str, object] = await asyncio.wait_for(
+                handoff_future, timeout=_STREAM_HANDOFF_TIMEOUT
+            )
+        except TimeoutError:
+            logger.error(
+                "Stream handoff timed out",
+                extra={"user_id": user_id, "message_id": message_id},
+            )
+            yield ServerSentEvent(data="Handoff timeout", event="error")
+            return
+
+        # 4. Handoff received — now stream from worker
+        yield ServerSentEvent(data="", event="processing")
+
+        async for event in stream_proxy.stream_from_worker(handoff_data):
+            yield event
+
+        # 5. Done
+        yield ServerSentEvent(data="", event="done")
+        logger.info(
+            "Stream completed successfully",
+            extra={"user_id": user_id, "message_id": message_id},
+        )
+
+    except asyncio.CancelledError:
+        logger.info(
+            "Client disconnected from stream",
+            extra={"user_id": user_id, "message_id": message_id},
+        )
+    finally:
+        # Always clean up: mark complete and trigger next
+        stream_proxy.unregister(message_id)
+        await queue_manager.mark_complete(user_id, message_id)
+        if message_processor and hasattr(message_processor, "trigger_processing"):
+            message_processor.trigger_processing(user_id)  # type: ignore[union-attr]
 
 
 @router.get("/api/v1/queue/{user_id}", response_model=QueueStatusResponse)

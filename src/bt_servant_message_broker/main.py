@@ -10,6 +10,7 @@ from bt_servant_message_broker.api.routes import router
 from bt_servant_message_broker.config import get_settings
 from bt_servant_message_broker.services.message_processor import MessageProcessor
 from bt_servant_message_broker.services.queue_manager import QueueManager
+from bt_servant_message_broker.services.stream_proxy import StreamProxy
 from bt_servant_message_broker.services.worker_client import WorkerClient
 from bt_servant_message_broker.utils.logging import get_logger, setup_logging
 
@@ -36,8 +37,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as e:
         logger.warning("Redis connection failed: %s", e)
 
-    # Initialize WorkerClient and MessageProcessor
+    # Initialize WorkerClient, StreamProxy, and MessageProcessor
     worker_client: WorkerClient | None = None
+    stream_proxy: StreamProxy | None = None
     message_processor: MessageProcessor | None = None
 
     if settings.worker_base_url and settings.worker_api_key:
@@ -48,8 +50,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         logger.info("WorkerClient initialized for %s", settings.worker_base_url)
 
+        stream_proxy = StreamProxy(
+            worker_base_url=settings.worker_base_url,
+            api_key=settings.worker_api_key,
+            timeout=settings.worker_timeout,
+        )
+        logger.info("StreamProxy initialized for %s", settings.worker_base_url)
+
         if queue_manager:
-            message_processor = MessageProcessor(queue_manager, worker_client)
+            message_processor = MessageProcessor(
+                queue_manager, worker_client, stream_proxy=stream_proxy
+            )
+            stream_proxy.configure(queue_manager, message_processor)
             logger.info("MessageProcessor initialized")
     else:
         logger.warning("Worker not configured (missing WORKER_BASE_URL or WORKER_API_KEY)")
@@ -58,11 +70,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.redis = redis_client
     app.state.queue_manager = queue_manager
     app.state.worker_client = worker_client
+    app.state.stream_proxy = stream_proxy
     app.state.message_processor = message_processor
 
     yield
 
     # Cleanup
+    if stream_proxy:
+        await stream_proxy.close()
     if worker_client:
         await worker_client.close()
     if redis_client:

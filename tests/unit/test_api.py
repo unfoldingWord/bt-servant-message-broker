@@ -1,17 +1,23 @@
 """Tests for API routes."""
 
-from unittest.mock import AsyncMock, MagicMock
+import json
+import os
+from collections.abc import AsyncIterator
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
+from sse_starlette.event import ServerSentEvent
 
 from bt_servant_message_broker.api.dependencies import (
     get_message_processor,
     get_queue_manager,
+    get_stream_proxy,
     get_worker_client,
 )
 from bt_servant_message_broker.main import app
 from bt_servant_message_broker.services.message_processor import MessageProcessor
 from bt_servant_message_broker.services.queue_manager import QueueManager
+from bt_servant_message_broker.services.stream_proxy import StreamProxy
 from bt_servant_message_broker.services.worker_client import WorkerClient
 
 
@@ -126,6 +132,30 @@ class TestMessageEndpoint:
             data = response.json()
             assert data["status"] == "queued"
             assert "queue_position" in data
+            assert "message_id" in data
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_submit_message_without_callback_url(self) -> None:
+        """Test that message is accepted without callback_url (SSE mode)."""
+        mock_qm = create_mock_queue_manager()
+        mock_processor = MagicMock(spec=MessageProcessor)
+        app.dependency_overrides[get_queue_manager] = lambda: mock_qm
+        app.dependency_overrides[get_message_processor] = lambda: mock_processor
+        try:
+            client = TestClient(app)
+            response = client.post(
+                "/api/v1/message",
+                json={
+                    "user_id": "user123",
+                    "org_id": "org456",
+                    "message": "Hello",
+                    "client_id": "web",
+                },
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "queued"
             assert "message_id" in data
         finally:
             app.dependency_overrides.clear()
@@ -271,3 +301,89 @@ class TestQueueStatusEndpoint:
         assert response.status_code == 503
         data = response.json()
         assert data["detail"] == "Queue service unavailable"
+
+
+class TestStreamEndpoint:
+    """Tests for the POST /api/v1/stream endpoint."""
+
+    _VALID_STREAM_BODY = {
+        "user_id": "user123",
+        "org_id": "org456",
+        "message": "Hello",
+        "client_id": "web",
+    }
+
+    def test_stream_returns_503_without_queue(self) -> None:
+        """503 when queue_manager is unavailable."""
+        app.dependency_overrides[get_stream_proxy] = lambda: MagicMock(spec=StreamProxy)
+        try:
+            client = TestClient(app)
+            response = client.post("/api/v1/stream", json=self._VALID_STREAM_BODY)
+            assert response.status_code == 503
+            assert response.json()["detail"] == "Queue service unavailable"
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_stream_returns_503_without_proxy(self) -> None:
+        """503 when stream_proxy is unavailable."""
+        mock_qm = create_mock_queue_manager()
+        app.dependency_overrides[get_queue_manager] = lambda: mock_qm
+        app.dependency_overrides[get_stream_proxy] = lambda: None
+        try:
+            client = TestClient(app)
+            response = client.post("/api/v1/stream", json=self._VALID_STREAM_BODY)
+            assert response.status_code == 503
+            assert response.json()["detail"] == "Stream service unavailable"
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_stream_returns_422_with_missing_fields(self) -> None:
+        """422 when required fields are missing from body."""
+        mock_qm = create_mock_queue_manager()
+        mock_proxy = MagicMock(spec=StreamProxy)
+        app.dependency_overrides[get_queue_manager] = lambda: mock_qm
+        app.dependency_overrides[get_stream_proxy] = lambda: mock_proxy
+        try:
+            client = TestClient(app)
+            response = client.post("/api/v1/stream", json={"user_id": "user123"})
+            assert response.status_code == 422
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_stream_requires_auth(self) -> None:
+        """401 without API key when auth is configured."""
+        os.environ["BROKER_API_KEY"] = "secret-key"
+        try:
+            client = TestClient(app)
+            response = client.post("/api/v1/stream", json=self._VALID_STREAM_BODY)
+            assert response.status_code == 401
+        finally:
+            os.environ.pop("BROKER_API_KEY", None)
+
+    def test_stream_returns_event_source_response(self) -> None:
+        """POST /api/v1/stream returns SSE content type when dependencies are met."""
+        mock_qm = create_mock_queue_manager()
+        mock_proxy = MagicMock(spec=StreamProxy)
+        mock_processor = MagicMock(spec=MessageProcessor)
+        app.dependency_overrides[get_queue_manager] = lambda: mock_qm
+        app.dependency_overrides[get_stream_proxy] = lambda: mock_proxy
+        app.dependency_overrides[get_message_processor] = lambda: mock_processor
+
+        async def fake_generator(
+            request: object,
+            queue_manager: object,
+            stream_proxy: object,
+            message_processor: object,
+        ) -> AsyncIterator[ServerSentEvent]:
+            yield ServerSentEvent(data=json.dumps({"message_id": "test-123"}), event="queued")
+            yield ServerSentEvent(data="", event="done")
+
+        try:
+            with patch("bt_servant_message_broker.api.routes._stream_generator", fake_generator):
+                client = TestClient(app)
+                response = client.post("/api/v1/stream", json=self._VALID_STREAM_BODY)
+                assert response.headers["content-type"].startswith("text/event-stream")
+                assert "event: queued" in response.text
+                assert "event: done" in response.text
+        finally:
+            app.dependency_overrides.clear()
