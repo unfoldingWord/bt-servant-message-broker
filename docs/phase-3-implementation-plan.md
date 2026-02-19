@@ -4,39 +4,62 @@
 
 ## Overview
 
-Implement the HTTP client for communicating with bt-servant-worker, handling sync request/response flow. This connects the queue system (Phase 2) to the actual AI processing backend.
+Implement the HTTP client for communicating with bt-servant-worker, handling async message processing with callback delivery. This connects the queue system (Phase 2) to the actual AI processing backend.
 
 ## Architecture
 
 ```
-Client → POST /api/v1/message → Broker
-                                  ↓
-                            1. Enqueue message
-                            2. Try dequeue (atomic)
-                                  ↓
-              ┌─ Dequeue succeeds ─┴─ Dequeue fails (busy) ─┐
-              ↓                                              ↓
-         Send to Worker                              Return "queued"
-              ↓
-         Mark Complete
-              ↓
-         Return Response ──────────────────────────────────────┐
-              ↓                                                │
-    [Background Task] ← Schedule next processing (non-blocking)│
-              ↓                                                │
-         Try dequeue → Process → Mark Complete → Schedule next │
-                                                               │
-    Note: Background tasks process queued messages without     │
-    blocking the original request. Each task processes one     │
-    message and spawns another task for the next (if any).     │
+Client sends message (with callback_url)
+    │
+    ├──► Broker: enqueue → return {"status":"queued"} immediately
+    │    Broker: trigger_processing(user_id)
+    │
+    │    [Background task]
+    │    dequeue → send to worker → get AI response
+    │    POST response to callback_url
+    │    mark_complete → trigger next
+    │
+    ◄── Client's callback endpoint receives response
+         (user_id in payload = WhatsApp phone number → sendToWhatsApp)
 ```
+
+### Always-Async Design
+
+Every message returns `{"status": "queued"}` immediately. All AI processing happens in background tasks. Responses are delivered via POST to the client's `callback_url`.
+
+This ensures **every message gets a visible response**, even when messages queue behind each other. The previous hybrid sync/async approach silently dropped responses for queued messages.
 
 ## Key Design Decisions
 
-1. **Hybrid sync/async**: Attempt immediate processing; return "queued" only if user already has message processing
-2. **Fail fast**: No retries at broker layer - return errors to client who can retry
-3. **Always mark complete**: Even on errors, to prevent queue stalling
-4. **Background queue drain**: After completing a message, spawn a background task to process next in queue (non-blocking, avoids request latency and recursion depth issues)
+1. **Always-async with callback**: Every message is queued and returns immediately. AI responses are delivered via POST to `callback_url`. No sync processing path.
+2. **Fail fast**: No retries at broker layer - return errors to client via error callback.
+3. **Always mark complete**: Even on errors, to prevent queue stalling.
+4. **Background queue drain**: After completing a message, spawn a background task to process next in queue (non-blocking, avoids recursion depth issues).
+5. **Error callbacks**: When worker processing fails, POST an error payload to `callback_url` so the client can inform the user.
+
+## Callback Payloads
+
+### Success Callback
+```json
+{
+  "message_id": "uuid",
+  "user_id": "15551234567",
+  "status": "completed",
+  "responses": ["Hello! How can I help?"],
+  "response_language": "en",
+  "voice_audio_base64": null
+}
+```
+
+### Error Callback
+```json
+{
+  "message_id": "uuid",
+  "user_id": "15551234567",
+  "status": "error",
+  "error": "Worker error 500: Internal server error"
+}
+```
 
 ## bt-servant-worker API
 
@@ -84,14 +107,15 @@ Response (200):
 
 ## Error Handling Matrix
 
-| Error | HTTP Status | Action |
-|-------|-------------|--------|
-| Worker timeout | 504 | Mark complete, return error |
-| Worker 4xx | Pass through | Mark complete, return error |
-| Worker 5xx | 502 | Mark complete, return error |
-| Worker unreachable | 503 | Mark complete, return error |
-| Redis unavailable | 503 | Fail before enqueue |
-| No message processor | 200 (queued) | Queue only, no processing |
+| Error | Action | Callback |
+|-------|--------|----------|
+| Worker timeout | Mark complete, schedule next | Error callback with timeout detail |
+| Worker 4xx | Mark complete, schedule next | Error callback with error detail |
+| Worker 5xx | Mark complete, schedule next | Error callback with error detail |
+| Worker unreachable | Mark complete, schedule next | Error callback with connection error |
+| No callback_url | Mark complete, schedule next | Warning logged, no delivery |
+| Redis unavailable | 503 HTTP response | N/A (fails before enqueue) |
+| No message processor | Queue only, no processing | N/A (no background task) |
 
 ## Verification Checklist
 
@@ -101,4 +125,4 @@ Response (200):
 - [x] `pyright` passes
 - [x] `lint-imports` passes
 - [x] `pytest --cov` passes with 65%+ coverage
-- [ ] E2E tests pass (see docs/test_plans/phase-3-e2e-tests.md)
+- [x] E2E tests pass (see docs/test_plans/phase-3-e2e-tests.md)

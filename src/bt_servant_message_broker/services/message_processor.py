@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 
+import httpx
+
 from bt_servant_message_broker.services.queue_manager import QueueManager
 from bt_servant_message_broker.services.worker_client import WorkerClient, WorkerResponse
 
@@ -13,11 +15,11 @@ logger = logging.getLogger(__name__)
 class MessageProcessor:
     """Orchestrates message processing through queue and worker.
 
-    Implements hybrid sync/async processing:
-    - Attempts immediate processing only when message is first in queue
-    - Returns None if user is busy or message is queued behind others
-    - After completing a message, spawns background task to process next
-    - Background tasks are non-blocking and don't add to request latency
+    All processing is asynchronous via background tasks:
+    - Route calls trigger_processing() after enqueue
+    - Background task dequeues and sends to worker
+    - Response delivered to callback_url if provided
+    - After completion, schedules next message processing
     """
 
     def __init__(self, queue_manager: QueueManager, worker_client: WorkerClient) -> None:
@@ -30,94 +32,16 @@ class MessageProcessor:
         self._queue = queue_manager
         self._worker = worker_client
 
-    async def process_message(
-        self, user_id: str, message_id: str, message_data: str, queue_position: int
-    ) -> WorkerResponse | None:
-        """Process a message if it's first in queue and user is not busy.
+    def trigger_processing(self, user_id: str) -> None:
+        """Kick off background processing for a user's queue.
 
-        Only attempts processing if queue_position is 1 (first in line).
-        This prevents returning responses for the wrong message.
+        Safe to call multiple times - if the user is already processing,
+        the background task will find the processing lock set and exit.
 
         Args:
             user_id: User identifier.
-            message_id: Message identifier.
-            message_data: JSON-serialized message data.
-            queue_position: Position in queue after enqueue (1-indexed).
-
-        Returns:
-            WorkerResponse if processed successfully, None if queued.
-
-        Raises:
-            WorkerError: If worker communication fails.
-            WorkerTimeoutError: If worker request times out.
         """
-        # Only attempt processing if we're first in queue
-        if queue_position > 1:
-            logger.debug(
-                "Message queued behind others",
-                extra={
-                    "user_id": user_id,
-                    "message_id": message_id,
-                    "queue_position": queue_position,
-                },
-            )
-            return None
-
-        # Try to dequeue (atomic check + pop)
-        dequeued = await self._queue.dequeue(user_id)
-        if dequeued is None:
-            # User is already processing another message
-            logger.debug(
-                "User is busy, message stays queued",
-                extra={"user_id": user_id, "message_id": message_id},
-            )
-            return None
-
-        dequeued_id, dequeued_data = dequeued
-
-        # Safety check: verify we got the expected message
-        # If not, we have a race condition - process it but don't return to this client
-        if dequeued_id != message_id:
-            logger.error(
-                "Message ID mismatch - dequeued different message than expected",
-                extra={
-                    "user_id": user_id,
-                    "expected_message_id": message_id,
-                    "dequeued_message_id": dequeued_id,
-                },
-            )
-            # Process the dequeued message but don't return its response to this client
-            try:
-                parsed = json.loads(dequeued_data)
-                await self._worker.send_message(parsed)
-                logger.info(
-                    "Processed mismatched message",
-                    extra={"user_id": user_id, "message_id": dequeued_id},
-                )
-            except Exception as e:
-                logger.error(
-                    "Failed to process mismatched message",
-                    extra={"user_id": user_id, "message_id": dequeued_id, "error": str(e)},
-                )
-            finally:
-                await self._queue.mark_complete(user_id, dequeued_id)
-                self._schedule_next_processing(user_id)
-            # Return None so client gets "queued" status (their message is still in queue)
-            return None
-
-        # Process the message
-        try:
-            parsed = json.loads(dequeued_data)
-            response = await self._worker.send_message(parsed)
-            logger.info(
-                "Processed message successfully",
-                extra={"user_id": user_id, "message_id": dequeued_id},
-            )
-            return response
-        finally:
-            # Always mark complete to prevent queue stalling
-            await self._queue.mark_complete(user_id, dequeued_id)
-            self._schedule_next_processing(user_id)
+        self._schedule_next_processing(user_id)
 
     def _schedule_next_processing(self, user_id: str) -> None:
         """Schedule background task to process next message in queue.
@@ -128,10 +52,11 @@ class MessageProcessor:
         asyncio.create_task(self._process_next_message(user_id))
 
     async def _process_next_message(self, user_id: str) -> None:
-        """Process the next message in queue (background task).
+        """Process the next message in queue and deliver via callback.
 
         This runs as a fire-and-forget background task. It processes one
-        message and schedules another task for the next, avoiding recursion.
+        message, delivers the response to the callback_url if provided,
+        and schedules another task for the next message.
         """
         try:
             dequeued = await self._queue.dequeue(user_id)
@@ -144,22 +69,46 @@ class MessageProcessor:
 
             message_id, message_data = dequeued
             logger.info(
-                "Processing queued message in background",
+                "Processing message in background",
                 extra={"user_id": user_id, "message_id": message_id},
             )
 
+            callback_url: str | None = None
+            msg_user_id = user_id
+
             try:
                 parsed = json.loads(message_data)
-                await self._worker.send_message(parsed)
+                msg_user_id = parsed.get("user_id", user_id)
+                callback_url = parsed.get("callback_url")
+
+                response = await self._worker.send_message(parsed)
                 logger.info(
-                    "Background message processed successfully",
+                    "Message processed successfully",
                     extra={"user_id": user_id, "message_id": message_id},
                 )
+
+                # Deliver response via callback if URL was provided
+                if callback_url:
+                    await self._deliver_callback(callback_url, message_id, msg_user_id, response)
+                else:
+                    logger.warning(
+                        "No callback_url - response cannot be delivered to client",
+                        extra={"user_id": user_id, "message_id": message_id},
+                    )
             except Exception as e:
                 logger.error(
-                    "Background message processing failed",
-                    extra={"user_id": user_id, "message_id": message_id, "error": str(e)},
+                    "Message processing failed",
+                    extra={
+                        "user_id": user_id,
+                        "message_id": message_id,
+                        "error": str(e),
+                    },
                 )
+                # Deliver error via callback if URL was provided
+                if callback_url:
+                    await self._deliver_error_callback(
+                        callback_url, message_id, msg_user_id, str(e)
+                    )
             finally:
                 await self._queue.mark_complete(user_id, message_id)
                 # Schedule next message processing (non-recursive: new task)
@@ -169,4 +118,113 @@ class MessageProcessor:
             logger.error(
                 "Background processing task failed",
                 extra={"user_id": user_id, "error": str(e)},
+            )
+
+    async def _deliver_callback(
+        self,
+        callback_url: str,
+        message_id: str,
+        user_id: str,
+        response: WorkerResponse,
+    ) -> None:
+        """POST worker response to the client's callback URL.
+
+        Args:
+            callback_url: URL to deliver the response to.
+            message_id: Message ID for correlation.
+            user_id: User ID for routing (e.g. WhatsApp phone number).
+            response: Worker response to deliver.
+        """
+        payload = {
+            "message_id": message_id,
+            "user_id": user_id,
+            "status": "completed",
+            "responses": response.responses,
+            "response_language": response.response_language,
+            "voice_audio_base64": response.voice_audio_base64,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                result = await client.post(callback_url, json=payload)
+
+            if result.status_code >= 400:
+                logger.error(
+                    "Callback delivery got error response",
+                    extra={
+                        "message_id": message_id,
+                        "callback_url": callback_url,
+                        "status_code": result.status_code,
+                    },
+                )
+            else:
+                logger.info(
+                    "Callback delivered successfully",
+                    extra={
+                        "message_id": message_id,
+                        "callback_url": callback_url,
+                        "status_code": result.status_code,
+                    },
+                )
+        except Exception as e:
+            logger.error(
+                "Callback delivery failed",
+                extra={
+                    "message_id": message_id,
+                    "callback_url": callback_url,
+                    "error": str(e),
+                },
+            )
+
+    async def _deliver_error_callback(
+        self,
+        callback_url: str,
+        message_id: str,
+        user_id: str,
+        error_detail: str,
+    ) -> None:
+        """POST error details to the client's callback URL.
+
+        Args:
+            callback_url: URL to deliver the error to.
+            message_id: Message ID for correlation.
+            user_id: User ID for routing.
+            error_detail: Description of what went wrong.
+        """
+        payload = {
+            "message_id": message_id,
+            "user_id": user_id,
+            "status": "error",
+            "error": error_detail,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                result = await client.post(callback_url, json=payload)
+
+            if result.status_code >= 400:
+                logger.error(
+                    "Error callback delivery got error response",
+                    extra={
+                        "message_id": message_id,
+                        "callback_url": callback_url,
+                        "status_code": result.status_code,
+                    },
+                )
+            else:
+                logger.info(
+                    "Error callback delivered",
+                    extra={
+                        "message_id": message_id,
+                        "callback_url": callback_url,
+                    },
+                )
+        except Exception as e:
+            logger.error(
+                "Error callback delivery failed",
+                extra={
+                    "message_id": message_id,
+                    "callback_url": callback_url,
+                    "error": str(e),
+                },
             )

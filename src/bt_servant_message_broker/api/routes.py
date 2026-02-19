@@ -18,7 +18,6 @@ from bt_servant_message_broker.models import (
     QueueStatusResponse,
 )
 from bt_servant_message_broker.services.queue_manager import QueueManager
-from bt_servant_message_broker.services.worker_client import WorkerError, WorkerTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +33,9 @@ async def submit_message(
 ) -> MessageResponse:
     """Submit a message for processing.
 
-    The message is queued and processed in FIFO order per user.
-    If the user has no messages currently processing, the message is
-    processed immediately and the response is returned synchronously.
-    Otherwise, the message is queued and the response indicates queued status.
+    The message is enqueued and always returns "queued" immediately.
+    Background processing delivers the AI response to the client's
+    callback_url via POST when complete.
     """
     logger.info(
         "Received message submission",
@@ -57,55 +55,17 @@ async def submit_message(
     message_data = request.model_dump_json()
     position = await queue_manager.enqueue(request.user_id, message_id, message_data)
 
-    # Try to process immediately if message processor is available
+    # Trigger background processing (response delivered via callback_url)
     if message_processor:
-        try:
-            response = await message_processor.process_message(
-                request.user_id, message_id, message_data, position
-            )
-            if response:
-                logger.info(
-                    "Message processed immediately",
-                    extra={
-                        "user_id": request.user_id,
-                        "message_id": message_id,
-                        "status": "completed",
-                    },
-                )
-                return MessageResponse(
-                    status="completed",
-                    message_id=message_id,
-                    responses=response.responses,
-                    response_language=response.response_language,
-                    voice_audio_base64=response.voice_audio_base64,
-                )
-        except WorkerTimeoutError as e:
-            logger.error(
-                "Worker timeout during message processing",
-                extra={"user_id": request.user_id, "message_id": message_id},
-            )
-            raise HTTPException(status_code=504, detail="Worker request timed out") from e
-        except WorkerError as e:
-            logger.error(
-                "Worker error during message processing",
-                extra={
-                    "user_id": request.user_id,
-                    "message_id": message_id,
-                    "worker_status_code": e.status_code,
-                },
-            )
-            # Pass through 4xx, wrap 5xx as 502
-            status_code = 502 if e.status_code >= 500 else e.status_code
-            raise HTTPException(status_code=status_code, detail=e.detail) from e
+        message_processor.trigger_processing(request.user_id)
 
-    # Message stays queued (user busy or no processor configured)
     logger.info(
-        "Message queued (user busy or no processor)",
+        "Message queued for background processing",
         extra={
             "user_id": request.user_id,
             "message_id": message_id,
             "queue_position": position,
-            "status": "queued",
+            "has_callback_url": request.callback_url is not None,
         },
     )
     return MessageResponse(
