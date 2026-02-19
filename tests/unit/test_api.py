@@ -119,6 +119,7 @@ class TestMessageEndpoint:
                     "org_id": "org456",
                     "message": "Hello",
                     "client_id": "web",
+                    "callback_url": "https://example.com/callback",
                 },
             )
             assert response.status_code == 200
@@ -129,14 +130,15 @@ class TestMessageEndpoint:
         finally:
             app.dependency_overrides.clear()
 
-    def test_submit_message_triggers_processing(self) -> None:
-        """Test that trigger_processing is called after enqueue."""
+    def test_submit_message_triggers_processing_when_first(self) -> None:
+        """Test that trigger_processing is called when message is first in queue."""
         mock_qm = create_mock_queue_manager()
         mock_processor = MagicMock(spec=MessageProcessor)
         app.dependency_overrides[get_queue_manager] = lambda: mock_qm
         app.dependency_overrides[get_message_processor] = lambda: mock_processor
         try:
             client = TestClient(app)
+            # Mock enqueue returns position 1 (first in queue via rpush=1)
             client.post(
                 "/api/v1/message",
                 json={
@@ -144,9 +146,37 @@ class TestMessageEndpoint:
                     "org_id": "org456",
                     "message": "Hello",
                     "client_id": "web",
+                    "callback_url": "https://example.com/callback",
                 },
             )
             mock_processor.trigger_processing.assert_called_once_with("user123")
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_submit_message_skips_trigger_when_not_first(self) -> None:
+        """Test that trigger_processing is NOT called when message is queued behind another."""
+        mock_qm = create_mock_queue_manager()
+        # Make rpush return 2 (second in queue)
+        mock_qm._redis.rpush = AsyncMock(return_value=2)
+        mock_processor = MagicMock(spec=MessageProcessor)
+        app.dependency_overrides[get_queue_manager] = lambda: mock_qm
+        app.dependency_overrides[get_message_processor] = lambda: mock_processor
+        try:
+            client = TestClient(app)
+            response = client.post(
+                "/api/v1/message",
+                json={
+                    "user_id": "user123",
+                    "org_id": "org456",
+                    "message": "Hello",
+                    "client_id": "web",
+                    "callback_url": "https://example.com/callback",
+                },
+            )
+            assert response.status_code == 200
+            assert response.json()["status"] == "queued"
+            # Should NOT trigger processing - background drain handles it
+            mock_processor.trigger_processing.assert_not_called()
         finally:
             app.dependency_overrides.clear()
 
@@ -164,6 +194,7 @@ class TestMessageEndpoint:
                     "org_id": "org456",
                     "message": "Hello",
                     "client_id": "web",
+                    "callback_url": "https://example.com/callback",
                 },
             )
             assert response.status_code == 200
@@ -207,6 +238,7 @@ class TestMessageEndpoint:
                 "org_id": "org456",
                 "message": "Hello",
                 "client_id": "web",
+                "callback_url": "https://example.com/callback",
             },
         )
         assert response.status_code == 503

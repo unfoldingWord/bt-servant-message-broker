@@ -55,8 +55,9 @@ async def submit_message(
     message_data = request.model_dump_json()
     position = await queue_manager.enqueue(request.user_id, message_id, message_data)
 
-    # Trigger background processing (response delivered via callback_url)
-    if message_processor:
+    # Only trigger background processing for first-in-queue;
+    # the background drain handles subsequent messages after each completion.
+    if message_processor and position == 1:
         message_processor.trigger_processing(request.user_id)
 
     logger.info(
@@ -65,7 +66,6 @@ async def submit_message(
             "user_id": request.user_id,
             "message_id": message_id,
             "queue_position": position,
-            "has_callback_url": request.callback_url is not None,
         },
     )
     return MessageResponse(

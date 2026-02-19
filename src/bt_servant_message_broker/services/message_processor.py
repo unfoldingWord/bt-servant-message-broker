@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from urllib.parse import urlparse
 
 import httpx
 
@@ -10,6 +11,12 @@ from bt_servant_message_broker.services.queue_manager import QueueManager
 from bt_servant_message_broker.services.worker_client import WorkerClient, WorkerResponse
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_url_for_log(url: str) -> str:
+    """Return scheme://host for safe logging (strip path/query/fragment)."""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.hostname}"
 
 
 class MessageProcessor:
@@ -153,7 +160,7 @@ class MessageProcessor:
                     "Callback delivery got error response",
                     extra={
                         "message_id": message_id,
-                        "callback_url": callback_url,
+                        "callback_url": _sanitize_url_for_log(callback_url),
                         "status_code": result.status_code,
                     },
                 )
@@ -162,7 +169,7 @@ class MessageProcessor:
                     "Callback delivered successfully",
                     extra={
                         "message_id": message_id,
-                        "callback_url": callback_url,
+                        "callback_url": _sanitize_url_for_log(callback_url),
                         "status_code": result.status_code,
                     },
                 )
@@ -171,7 +178,7 @@ class MessageProcessor:
                 "Callback delivery failed",
                 extra={
                     "message_id": message_id,
-                    "callback_url": callback_url,
+                    "callback_url": _sanitize_url_for_log(callback_url),
                     "error": str(e),
                 },
             )
@@ -207,7 +214,7 @@ class MessageProcessor:
                     "Error callback delivery got error response",
                     extra={
                         "message_id": message_id,
-                        "callback_url": callback_url,
+                        "callback_url": _sanitize_url_for_log(callback_url),
                         "status_code": result.status_code,
                     },
                 )
@@ -216,7 +223,7 @@ class MessageProcessor:
                     "Error callback delivered",
                     extra={
                         "message_id": message_id,
-                        "callback_url": callback_url,
+                        "callback_url": _sanitize_url_for_log(callback_url),
                     },
                 )
         except Exception as e:
@@ -224,7 +231,7 @@ class MessageProcessor:
                 "Error callback delivery failed",
                 extra={
                     "message_id": message_id,
-                    "callback_url": callback_url,
+                    "callback_url": _sanitize_url_for_log(callback_url),
                     "error": str(e),
                 },
             )
