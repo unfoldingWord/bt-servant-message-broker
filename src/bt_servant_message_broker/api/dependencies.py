@@ -8,6 +8,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from bt_servant_message_broker.config import Settings, get_settings
 from bt_servant_message_broker.services.message_processor import MessageProcessor
 from bt_servant_message_broker.services.queue_manager import QueueManager
+from bt_servant_message_broker.services.stream_proxy import StreamProxy
 from bt_servant_message_broker.services.worker_client import WorkerClient
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,18 @@ def get_message_processor(request: Request) -> MessageProcessor | None:
     return getattr(request.app.state, "message_processor", None)
 
 
+def get_stream_proxy(request: Request) -> StreamProxy | None:
+    """Get the StreamProxy from app state.
+
+    Args:
+        request: FastAPI request object.
+
+    Returns:
+        StreamProxy instance or None if not configured.
+    """
+    return getattr(request.app.state, "stream_proxy", None)
+
+
 # Dependency for protected routes
 RequireApiKey = Annotated[str, Depends(verify_api_key)]
 
@@ -98,3 +111,6 @@ RequireWorkerClient = Annotated[WorkerClient | None, Depends(get_worker_client)]
 
 # Dependency for message processor
 RequireMessageProcessor = Annotated[MessageProcessor | None, Depends(get_message_processor)]
+
+# Dependency for stream proxy
+RequireStreamProxy = Annotated[StreamProxy | None, Depends(get_stream_proxy)]

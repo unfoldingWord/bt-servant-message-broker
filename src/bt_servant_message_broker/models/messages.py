@@ -23,8 +23,12 @@ class ClientId(str, Enum):
     TELEGRAM = "telegram"
 
 
-class MessageRequest(BaseModel):
-    """Request body for POST /api/v1/message."""
+class _BaseMessageRequest(BaseModel):
+    """Shared fields and validation for message submission requests.
+
+    Both MessageRequest (callback delivery) and StreamRequest (SSE streaming)
+    inherit from this base class.
+    """
 
     user_id: str = Field(..., description="Unique user identifier")
     org_id: str = Field(..., description="Organization identifier")
@@ -36,15 +40,47 @@ class MessageRequest(BaseModel):
     audio_format: str | None = Field(default=None, description="Audio format (e.g., 'ogg', 'mp3')")
     client_id: ClientId = Field(..., description="Originating client identifier")
     client_message_id: str | None = Field(default=None, description="Client-side message ID")
-    callback_url: str = Field(..., description="URL for async response delivery (HTTPS required)")
+
+    @model_validator(mode="after")
+    def validate_audio_requirements(self) -> Self:
+        """Validate audio-specific requirements.
+
+        When message_type is audio:
+        - audio_base64 and audio_format are required
+        - message can be empty
+
+        When message_type is text:
+        - message is required (non-empty)
+        """
+        if self.message_type == MessageType.AUDIO:
+            if not self.audio_base64:
+                raise ValueError("audio_base64 is required when message_type is 'audio'")
+            if not self.audio_format:
+                raise ValueError("audio_format is required when message_type is 'audio'")
+        elif self.message_type == MessageType.TEXT:
+            if not self.message:
+                raise ValueError("message is required when message_type is 'text'")
+        return self
+
+
+class MessageRequest(_BaseMessageRequest):
+    """Request body for POST /api/v1/message."""
+
+    callback_url: str | None = Field(
+        default=None,
+        description="URL for async response delivery (HTTPS required, omit for SSE streaming)",
+    )
 
     @field_validator("callback_url")
     @classmethod
-    def validate_callback_url_security(cls, v: str) -> str:
+    def validate_callback_url_security(cls, v: str | None) -> str | None:
         """Validate callback URL to prevent SSRF.
 
         Requires HTTPS scheme and blocks private/loopback/link-local IP ranges.
+        Skips validation when callback_url is None (SSE streaming mode).
         """
+        if v is None:
+            return v
         parsed = urlparse(v)
         if parsed.scheme != "https":
             raise ValueError("callback_url must use HTTPS")
@@ -68,26 +104,9 @@ class MessageRequest(BaseModel):
                 raise ValueError("callback_url must not target private/internal networks")
         return v
 
-    @model_validator(mode="after")
-    def validate_audio_requirements(self) -> Self:
-        """Validate audio-specific requirements.
 
-        When message_type is audio:
-        - audio_base64 and audio_format are required
-        - message can be empty
-
-        When message_type is text:
-        - message is required (non-empty)
-        """
-        if self.message_type == MessageType.AUDIO:
-            if not self.audio_base64:
-                raise ValueError("audio_base64 is required when message_type is 'audio'")
-            if not self.audio_format:
-                raise ValueError("audio_format is required when message_type is 'audio'")
-        elif self.message_type == MessageType.TEXT:
-            if not self.message:
-                raise ValueError("message is required when message_type is 'text'")
-        return self
+class StreamRequest(_BaseMessageRequest):
+    """Request body for POST /api/v1/stream (SSE streaming, no callback)."""
 
 
 class QueuedResponse(BaseModel):

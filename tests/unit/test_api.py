@@ -1,5 +1,8 @@
 """Tests for API routes."""
 
+import json
+import os
+from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
@@ -7,6 +10,7 @@ from fastapi.testclient import TestClient
 from bt_servant_message_broker.api.dependencies import (
     get_message_processor,
     get_queue_manager,
+    get_stream_proxy,
     get_worker_client,
 )
 from bt_servant_message_broker.main import app
@@ -126,6 +130,30 @@ class TestMessageEndpoint:
             data = response.json()
             assert data["status"] == "queued"
             assert "queue_position" in data
+            assert "message_id" in data
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_submit_message_without_callback_url(self) -> None:
+        """Test that message is accepted without callback_url (SSE mode)."""
+        mock_qm = create_mock_queue_manager()
+        mock_processor = MagicMock(spec=MessageProcessor)
+        app.dependency_overrides[get_queue_manager] = lambda: mock_qm
+        app.dependency_overrides[get_message_processor] = lambda: mock_processor
+        try:
+            client = TestClient(app)
+            response = client.post(
+                "/api/v1/message",
+                json={
+                    "user_id": "user123",
+                    "org_id": "org456",
+                    "message": "Hello",
+                    "client_id": "web",
+                },
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "queued"
             assert "message_id" in data
         finally:
             app.dependency_overrides.clear()
@@ -271,3 +299,55 @@ class TestQueueStatusEndpoint:
         assert response.status_code == 503
         data = response.json()
         assert data["detail"] == "Queue service unavailable"
+
+
+class TestStreamEndpoint:
+    """Tests for the GET /api/v1/stream endpoint."""
+
+    def test_stream_endpoint_returns_sse(self) -> None:
+        """GET /api/v1/stream returns EventSourceResponse with SSE content type."""
+
+        class FakeStreamProxy:
+            async def proxy_stream(
+                self, user_id: str, message_id: str
+            ) -> AsyncGenerator[dict[str, str], None]:
+                yield {
+                    "event": "queued",
+                    "data": json.dumps({"message_id": message_id}),
+                }
+                yield {
+                    "event": "done",
+                    "data": json.dumps({"message_id": message_id}),
+                }
+
+        app.dependency_overrides[get_stream_proxy] = FakeStreamProxy
+        try:
+            client = TestClient(app)
+            response = client.get("/api/v1/stream?user_id=user1&message_id=msg1")
+            assert response.headers["content-type"].startswith("text/event-stream")
+            body = response.text
+            assert "event: queued" in body
+            assert "event: done" in body
+        finally:
+            app.dependency_overrides.clear()
+
+    def test_stream_endpoint_requires_auth(self) -> None:
+        """401 without API key when auth is configured."""
+        os.environ["BROKER_API_KEY"] = "secret-key"
+        try:
+            client = TestClient(app)
+            response = client.get("/api/v1/stream?user_id=user1&message_id=msg1")
+            assert response.status_code == 401
+        finally:
+            os.environ.pop("BROKER_API_KEY", None)
+
+    def test_stream_endpoint_503_without_proxy(self) -> None:
+        """503 when stream_proxy is unavailable."""
+        app.dependency_overrides[get_stream_proxy] = lambda: None
+        try:
+            client = TestClient(app)
+            response = client.get("/api/v1/stream?user_id=user1&message_id=msg1")
+            assert response.status_code == 503
+            assert response.json()["detail"] == "Streaming service unavailable"
+        finally:
+            app.dependency_overrides.clear()

@@ -1,5 +1,6 @@
 """Tests for WorkerClient."""
 
+from collections.abc import AsyncGenerator
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -268,3 +269,59 @@ class TestWorkerClient:
         # Should not raise an error
         await client.close()
         assert client._client is None
+
+
+class TestStreamMessage:
+    """Tests for stream_message method."""
+
+    @pytest.fixture
+    def client(self) -> WorkerClient:
+        """Create a WorkerClient instance."""
+        return WorkerClient(
+            base_url="http://worker.test",
+            api_key="test-key",
+            timeout=10.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_message_returns_lines(self, client: WorkerClient) -> None:
+        """Test that stream_message yields SSE lines from worker."""
+        mock_response = AsyncMock()
+        mock_response.status_code = 200
+
+        async def mock_aiter_lines() -> AsyncGenerator[str, None]:
+            for line in ["event: token", "data: Hello", "", "data: World"]:
+                yield line
+
+        mock_response.aiter_lines = mock_aiter_lines
+
+        mock_stream_cm = AsyncMock()
+        mock_stream_cm.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_stream_cm.__aexit__ = AsyncMock(return_value=None)
+
+        with patch.object(httpx.AsyncClient, "stream", return_value=mock_stream_cm):
+            lines = []
+            async for line in client.stream_message(
+                {"user_id": "user1", "org_id": "org1", "message": "hi"}
+            ):
+                lines.append(line)
+
+        assert lines == ["event: token", "data: Hello", "", "data: World"]
+
+    @pytest.mark.asyncio
+    async def test_stream_message_worker_error(self, client: WorkerClient) -> None:
+        """Test that stream_message raises WorkerError on 4xx/5xx."""
+        mock_response = AsyncMock()
+        mock_response.status_code = 500
+        mock_response.aread = AsyncMock(return_value=b"Internal Server Error")
+
+        mock_stream_cm = AsyncMock()
+        mock_stream_cm.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_stream_cm.__aexit__ = AsyncMock(return_value=None)
+
+        with patch.object(httpx.AsyncClient, "stream", return_value=mock_stream_cm):
+            with pytest.raises(WorkerError) as exc_info:
+                async for _line in client.stream_message({"user_id": "test"}):
+                    pass
+
+            assert exc_info.value.status_code == 502

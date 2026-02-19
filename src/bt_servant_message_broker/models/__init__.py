@@ -8,6 +8,7 @@ from bt_servant_message_broker.models.messages import (
     MessageType,
     QueuedResponse,
     QueueStatusResponse,
+    StreamRequest,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "MessageType",
     "QueuedResponse",
     "QueueStatusResponse",
+    "StreamRequest",
 ]

@@ -4,11 +4,13 @@ import logging
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
+from sse_starlette.sse import EventSourceResponse
 
 from bt_servant_message_broker.api.dependencies import (
     RequireApiKey,
     RequireMessageProcessor,
     RequireQueueManager,
+    RequireStreamProxy,
     RequireWorkerClient,
 )
 from bt_servant_message_broker.models import (
@@ -73,6 +75,26 @@ async def submit_message(
         message_id=message_id,
         queue_position=position,
     )
+
+
+@router.get("/api/v1/stream")
+async def stream_response(
+    user_id: str,
+    message_id: str,
+    _api_key: RequireApiKey,
+    stream_proxy: RequireStreamProxy,
+) -> EventSourceResponse:
+    """Stream AI response for a previously queued message via SSE.
+
+    The message must already be enqueued via POST /api/v1/message.
+    The client opens this SSE connection with the returned message_id
+    and receives events as the message progresses through the queue.
+    """
+    if stream_proxy is None:
+        logger.error("Stream proxy unavailable")
+        raise HTTPException(status_code=503, detail="Streaming service unavailable")
+
+    return EventSourceResponse(stream_proxy.proxy_stream(user_id, message_id))
 
 
 @router.get("/api/v1/queue/{user_id}", response_model=QueueStatusResponse)
