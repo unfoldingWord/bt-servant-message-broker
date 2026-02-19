@@ -1,8 +1,10 @@
 """Message processing orchestration layer."""
 
 import asyncio
+import ipaddress
 import json
 import logging
+import socket
 from urllib.parse import urlparse
 
 import httpx
@@ -17,6 +19,41 @@ def _sanitize_url_for_log(url: str) -> str:
     """Return scheme://host for safe logging (strip path/query/fragment)."""
     parsed = urlparse(url)
     return f"{parsed.scheme}://{parsed.hostname}"
+
+
+async def _validate_callback_host(callback_url: str) -> None:
+    """Resolve callback hostname and block private/internal IPs (SSRF prevention).
+
+    Complements the model-level literal-IP checks by catching DNS rebinding
+    attacks where a public hostname resolves to a private/link-local address.
+
+    Raises:
+        ValueError: If any resolved IP is in a blocked range.
+    """
+    hostname = urlparse(callback_url).hostname
+    if not hostname:
+        raise ValueError("callback_url has no hostname")
+
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return  # DNS resolution failed - let httpx surface the connection error
+
+    for info in infos:
+        ip_str = info[4][0]
+        try:
+            addr = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if (
+            addr.is_private
+            or addr.is_loopback
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_unspecified
+        ):
+            raise ValueError(f"callback_url hostname resolves to blocked IP: {ip_str}")
 
 
 class MessageProcessor:
@@ -142,6 +179,15 @@ class MessageProcessor:
             user_id: User ID for routing (e.g. WhatsApp phone number).
             response: Worker response to deliver.
         """
+        try:
+            await _validate_callback_host(callback_url)
+        except ValueError as e:
+            logger.error(
+                "Callback blocked by SSRF protection",
+                extra={"message_id": message_id, "error": str(e)},
+            )
+            return
+
         payload = {
             "message_id": message_id,
             "user_id": user_id,
@@ -198,6 +244,15 @@ class MessageProcessor:
             user_id: User ID for routing.
             error_detail: Description of what went wrong.
         """
+        try:
+            await _validate_callback_host(callback_url)
+        except ValueError as e:
+            logger.error(
+                "Error callback blocked by SSRF protection",
+                extra={"message_id": message_id, "error": str(e)},
+            )
+            return
+
         payload = {
             "message_id": message_id,
             "user_id": user_id,
