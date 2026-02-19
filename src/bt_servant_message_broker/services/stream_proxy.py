@@ -49,6 +49,7 @@ class StreamProxy:
         self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
         self._registry: dict[str, _PendingStream] = {}
+        self._registration_events: dict[str, asyncio.Event] = {}
         self._queue: QueueManager | None = None
         self._processor: MessageProcessor | None = None
 
@@ -76,7 +77,38 @@ class StreamProxy:
         pending = _PendingStream(future=loop.create_future())
         self._registry[message_id] = pending
         logger.debug("Registered stream for message %s", message_id)
+        # Notify any processor waiting for this registration
+        event = self._registration_events.get(message_id)
+        if event:
+            event.set()
         return pending.future
+
+    async def wait_for_registration(self, message_id: str, timeout: float) -> bool:
+        """Wait for an SSE client to register a stream for the given message.
+
+        Called by the background processor when it dequeues an SSE message
+        (no callback_url) that hasn't been registered yet. This handles the
+        drain-chain race where processing reaches a message before the client
+        opens the SSE connection.
+
+        Returns:
+            True if registered within timeout, False if timed out.
+        """
+        if self.is_registered(message_id):
+            return True
+        event = asyncio.Event()
+        self._registration_events[message_id] = event
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return self.is_registered(message_id)
+        except TimeoutError:
+            logger.warning(
+                "Timed out waiting for SSE stream registration",
+                extra={"message_id": message_id, "timeout": timeout},
+            )
+            return False
+        finally:
+            self._registration_events.pop(message_id, None)
 
     def unregister(self, message_id: str) -> None:
         """Remove a message_id from the registry without handoff."""
@@ -174,8 +206,12 @@ class StreamProxy:
         ``sse_starlette.EventSourceResponse``.
         """
         handoff_future = self.register(message_id)
-        if self._processor:
-            self._processor.trigger_processing(user_id)
+        if self._processor and self._queue:
+            has_work = await self._queue.get_queue_length(
+                user_id
+            ) > 0 or await self._queue.is_processing(user_id)
+            if has_work:
+                self._processor.trigger_processing(user_id)
         try:
             yield {"event": "queued", "data": json.dumps({"message_id": message_id})}
 
