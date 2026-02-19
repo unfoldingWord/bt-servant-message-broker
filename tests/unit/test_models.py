@@ -12,6 +12,8 @@ from bt_servant_message_broker.models import (
     QueueStatusResponse,
 )
 
+VALID_CALLBACK_URL = "https://example.com/callback"
+
 
 class TestMessageRequest:
     """Tests for MessageRequest model."""
@@ -23,6 +25,7 @@ class TestMessageRequest:
             org_id="org456",
             message="Hello",
             client_id=ClientId.WEB,
+            callback_url=VALID_CALLBACK_URL,
         )
         assert request.user_id == "user123"
         assert request.org_id == "org456"
@@ -32,7 +35,7 @@ class TestMessageRequest:
         assert request.audio_base64 is None
         assert request.audio_format is None
         assert request.client_message_id is None
-        assert request.callback_url is None
+        assert request.callback_url == VALID_CALLBACK_URL
 
     def test_full_request(self) -> None:
         """Test creating a request with all fields."""
@@ -45,19 +48,29 @@ class TestMessageRequest:
             audio_format="ogg",
             client_id=ClientId.WHATSAPP,
             client_message_id="msg789",
-            callback_url="https://example.com/callback",
+            callback_url=VALID_CALLBACK_URL,
         )
         assert request.message_type == MessageType.AUDIO
         assert request.audio_base64 == "base64data"
         assert request.audio_format == "ogg"
         assert request.client_id == ClientId.WHATSAPP
         assert request.client_message_id == "msg789"
-        assert request.callback_url == "https://example.com/callback"
+        assert request.callback_url == VALID_CALLBACK_URL
 
     def test_missing_required_fields(self) -> None:
         """Test that missing required fields raise ValidationError."""
         with pytest.raises(ValidationError):
             MessageRequest(user_id="user123")  # type: ignore[call-arg]
+
+    def test_missing_callback_url(self) -> None:
+        """Test that missing callback_url raises ValidationError."""
+        with pytest.raises(ValidationError):
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="Hello",
+                client_id=ClientId.WEB,
+            )  # type: ignore[call-arg]
 
     def test_invalid_client_id(self) -> None:
         """Test that invalid client_id raises ValidationError."""
@@ -67,6 +80,7 @@ class TestMessageRequest:
                 org_id="org456",
                 message="Hello",
                 client_id="invalid",  # type: ignore[arg-type]
+                callback_url=VALID_CALLBACK_URL,
             )
 
     def test_invalid_message_type(self) -> None:
@@ -78,6 +92,7 @@ class TestMessageRequest:
                 message="Hello",
                 client_id=ClientId.WEB,
                 message_type="invalid",  # type: ignore[arg-type]
+                callback_url=VALID_CALLBACK_URL,
             )
 
     def test_audio_requires_audio_base64(self) -> None:
@@ -90,6 +105,7 @@ class TestMessageRequest:
                 message_type=MessageType.AUDIO,
                 audio_format="ogg",
                 client_id=ClientId.WEB,
+                callback_url=VALID_CALLBACK_URL,
             )
         assert "audio_base64 is required" in str(exc_info.value)
 
@@ -103,6 +119,7 @@ class TestMessageRequest:
                 message_type=MessageType.AUDIO,
                 audio_base64="base64data",
                 client_id=ClientId.WEB,
+                callback_url=VALID_CALLBACK_URL,
             )
         assert "audio_format is required" in str(exc_info.value)
 
@@ -115,6 +132,7 @@ class TestMessageRequest:
                 message="",
                 message_type=MessageType.TEXT,
                 client_id=ClientId.WEB,
+                callback_url=VALID_CALLBACK_URL,
             )
         assert "message is required" in str(exc_info.value)
 
@@ -128,9 +146,131 @@ class TestMessageRequest:
             audio_base64="base64data",
             audio_format="ogg",
             client_id=ClientId.WEB,
+            callback_url=VALID_CALLBACK_URL,
         )
         assert request.message == ""
         assert request.audio_base64 == "base64data"
+
+
+class TestCallbackUrlValidation:
+    """Tests for callback_url SSRF protection."""
+
+    def test_https_url_accepted(self) -> None:
+        """Test that HTTPS URLs are accepted."""
+        request = MessageRequest(
+            user_id="user123",
+            org_id="org456",
+            message="Hello",
+            client_id=ClientId.WEB,
+            callback_url="https://gateway.example.com/message-callback",
+        )
+        assert request.callback_url == "https://gateway.example.com/message-callback"
+
+    def test_http_url_rejected(self) -> None:
+        """Test that HTTP (non-HTTPS) URLs are rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="Hello",
+                client_id=ClientId.WEB,
+                callback_url="http://example.com/callback",
+            )
+        assert "HTTPS" in str(exc_info.value)
+
+    def test_localhost_rejected(self) -> None:
+        """Test that localhost is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="Hello",
+                client_id=ClientId.WEB,
+                callback_url="https://localhost/callback",
+            )
+        assert "localhost" in str(exc_info.value)
+
+    def test_loopback_ip_rejected(self) -> None:
+        """Test that 127.0.0.1 is rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="Hello",
+                client_id=ClientId.WEB,
+                callback_url="https://127.0.0.1/callback",
+            )
+        assert "private" in str(exc_info.value).lower() or "loopback" in str(exc_info.value).lower()
+
+    def test_private_ip_10_rejected(self) -> None:
+        """Test that 10.x.x.x private IPs are rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="Hello",
+                client_id=ClientId.WEB,
+                callback_url="https://10.0.0.1/callback",
+            )
+        assert "private" in str(exc_info.value).lower()
+
+    def test_private_ip_172_rejected(self) -> None:
+        """Test that 172.16.x.x private IPs are rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="Hello",
+                client_id=ClientId.WEB,
+                callback_url="https://172.16.0.1/callback",
+            )
+        assert "private" in str(exc_info.value).lower()
+
+    def test_private_ip_192_rejected(self) -> None:
+        """Test that 192.168.x.x private IPs are rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="Hello",
+                client_id=ClientId.WEB,
+                callback_url="https://192.168.1.1/callback",
+            )
+        assert "private" in str(exc_info.value).lower()
+
+    def test_link_local_ip_rejected(self) -> None:
+        """Test that 169.254.x.x link-local IPs are rejected."""
+        with pytest.raises(ValidationError) as exc_info:
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="Hello",
+                client_id=ClientId.WEB,
+                callback_url="https://169.254.169.254/latest/meta-data",
+            )
+        assert "private" in str(exc_info.value).lower()
+
+    def test_public_ip_accepted(self) -> None:
+        """Test that public IPs are accepted."""
+        request = MessageRequest(
+            user_id="user123",
+            org_id="org456",
+            message="Hello",
+            client_id=ClientId.WEB,
+            callback_url="https://8.8.8.8/callback",
+        )
+        assert request.callback_url == "https://8.8.8.8/callback"
+
+    def test_no_hostname_rejected(self) -> None:
+        """Test that URLs without valid hostname are rejected."""
+        with pytest.raises(ValidationError):
+            MessageRequest(
+                user_id="user123",
+                org_id="org456",
+                message="Hello",
+                client_id=ClientId.WEB,
+                callback_url="https:///callback",
+            )
 
 
 class TestQueuedResponse:

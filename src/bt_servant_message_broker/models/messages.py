@@ -1,9 +1,11 @@
 """Message models based on PRD API design."""
 
+import ipaddress
 from enum import Enum
 from typing import Literal, Self
+from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class MessageType(str, Enum):
@@ -34,7 +36,37 @@ class MessageRequest(BaseModel):
     audio_format: str | None = Field(default=None, description="Audio format (e.g., 'ogg', 'mp3')")
     client_id: ClientId = Field(..., description="Originating client identifier")
     client_message_id: str | None = Field(default=None, description="Client-side message ID")
-    callback_url: str | None = Field(default=None, description="URL for async response delivery")
+    callback_url: str = Field(..., description="URL for async response delivery (HTTPS required)")
+
+    @field_validator("callback_url")
+    @classmethod
+    def validate_callback_url_security(cls, v: str) -> str:
+        """Validate callback URL to prevent SSRF.
+
+        Requires HTTPS scheme and blocks private/loopback/link-local IP ranges.
+        """
+        parsed = urlparse(v)
+        if parsed.scheme != "https":
+            raise ValueError("callback_url must use HTTPS")
+        hostname = parsed.hostname
+        if not hostname:
+            raise ValueError("callback_url must have a valid hostname")
+        if hostname == "localhost":
+            raise ValueError("callback_url must not target localhost")
+        try:
+            addr = ipaddress.ip_address(hostname)
+        except ValueError:
+            pass  # Not an IP address (it's a hostname) - OK
+        else:
+            if (
+                addr.is_private
+                or addr.is_loopback
+                or addr.is_link_local
+                or addr.is_reserved
+                or addr.is_unspecified
+            ):
+                raise ValueError("callback_url must not target private/internal networks")
+        return v
 
     @model_validator(mode="after")
     def validate_audio_requirements(self) -> Self:
