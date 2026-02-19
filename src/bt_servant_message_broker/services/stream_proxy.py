@@ -174,6 +174,8 @@ class StreamProxy:
         ``sse_starlette.EventSourceResponse``.
         """
         handoff_future = self.register(message_id)
+        if self._processor:
+            self._processor.trigger_processing(user_id)
         try:
             yield {"event": "queued", "data": json.dumps({"message_id": message_id})}
 

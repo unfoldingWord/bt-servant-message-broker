@@ -372,6 +372,40 @@ class TestStreamHandoff:
         mock_queue.mark_complete.assert_called_once_with("user1", "msg-1")
 
 
+class TestProxyStreamTriggersProcessing:
+    """Tests that proxy_stream triggers processing after registration."""
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_triggers_processing_after_register(self) -> None:
+        """Test that proxy_stream calls trigger_processing after registering."""
+        mock_queue = AsyncMock()
+        mock_processor = MagicMock(spec=MessageProcessor)
+        proxy = StreamProxy(
+            worker_base_url="https://worker.example.com",
+            api_key="key",
+        )
+        proxy.configure(mock_queue, mock_processor)
+
+        # Collect the first yielded event (queued), then verify trigger was called.
+        async for event in proxy.proxy_stream("user1", "msg-1"):
+            assert event["event"] == "queued"
+            mock_processor.trigger_processing.assert_called_once_with("user1")
+            break  # Exit after first event; generator cleanup runs via finally
+
+    @pytest.mark.asyncio
+    async def test_proxy_stream_works_without_processor(self) -> None:
+        """Test that proxy_stream works when processor is not configured."""
+        proxy = StreamProxy(
+            worker_base_url="https://worker.example.com",
+            api_key="key",
+        )
+        # Don't call configure — _processor is None
+
+        async for event in proxy.proxy_stream("user1", "msg-1"):
+            assert event["event"] == "queued"
+            break  # Should not crash even without processor
+
+
 class TestStreamProxyClose:
     """Tests for StreamProxy cleanup."""
 

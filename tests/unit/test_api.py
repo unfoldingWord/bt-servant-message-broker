@@ -181,6 +181,30 @@ class TestMessageEndpoint:
         finally:
             app.dependency_overrides.clear()
 
+    def test_submit_message_skips_trigger_for_sse_mode(self) -> None:
+        """Test that trigger_processing is NOT called when no callback_url (SSE mode)."""
+        mock_qm = create_mock_queue_manager()
+        mock_processor = MagicMock(spec=MessageProcessor)
+        app.dependency_overrides[get_queue_manager] = lambda: mock_qm
+        app.dependency_overrides[get_message_processor] = lambda: mock_processor
+        try:
+            client = TestClient(app)
+            response = client.post(
+                "/api/v1/message",
+                json={
+                    "user_id": "user123",
+                    "org_id": "org456",
+                    "message": "Hello",
+                    "client_id": "web",
+                },
+            )
+            assert response.status_code == 200
+            assert response.json()["status"] == "queued"
+            # Should NOT trigger - SSE stream endpoint handles it after registration
+            mock_processor.trigger_processing.assert_not_called()
+        finally:
+            app.dependency_overrides.clear()
+
     def test_submit_message_skips_trigger_when_not_first(self) -> None:
         """Test that trigger_processing is NOT called when message is queued behind another."""
         mock_qm = create_mock_queue_manager()

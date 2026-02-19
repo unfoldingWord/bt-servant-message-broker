@@ -59,7 +59,7 @@ async def submit_message(
 
     # Only trigger background processing for first-in-queue;
     # the background drain handles subsequent messages after each completion.
-    if message_processor and position == 1:
+    if message_processor and position == 1 and request.callback_url:
         message_processor.trigger_processing(request.user_id)
 
     logger.info(
