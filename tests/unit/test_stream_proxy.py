@@ -112,7 +112,7 @@ class TestBuildWorkerPayload:
         assert payload["message"] == "hello"
         assert payload["message_type"] == "text"
         assert payload["client_id"] == "web"
-        assert payload["stream"] is True
+        assert "stream" not in payload
 
     def test_includes_audio_fields_when_present(self, stream_proxy: StreamProxy) -> None:
         """Test that audio fields are included when present."""

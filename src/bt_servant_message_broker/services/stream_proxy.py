@@ -149,14 +149,13 @@ class StreamProxy:
         return self._client
 
     def _build_worker_payload(self, message_data: dict[str, Any]) -> dict[str, Any]:
-        """Map broker message fields to worker /api/v1/chat payload."""
+        """Map broker message fields to worker /api/v1/chat/stream payload."""
         payload: dict[str, Any] = {
             "client_id": message_data.get("client_id"),
             "user_id": message_data.get("user_id"),
             "message": message_data.get("message"),
             "message_type": message_data.get("message_type", "text"),
             "org": message_data.get("org_id"),
-            "stream": True,
         }
         if message_data.get("audio_base64"):
             payload["audio_base64"] = message_data["audio_base64"]
@@ -171,7 +170,7 @@ class StreamProxy:
         client = await self._get_client()
         payload = self._build_worker_payload(message_data)
 
-        url = f"{self._worker_base_url}/api/v1/chat"
+        url = f"{self._worker_base_url}/api/v1/chat/stream"
         logger.info(
             "Opening SSE stream to worker",
             extra={
